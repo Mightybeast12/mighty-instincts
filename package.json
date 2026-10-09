@@ -1,0 +1,47 @@
+{
+  "name": "opencode-instincts",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin that observes session activity and distils it into ECC-compatible instincts, plus slash commands for the ECC instinct-cli.py workflow.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "vendor/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node smoke-test.mjs && bun smoke-test.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "instincts",
+    "continuous-learning",
+    "ecc"
+  ],
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.18 <3"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mightybeast12/opencode-instincts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mightybeast12/opencode-instincts/issues"
+  },
+  "homepage": "https://github.com/Mightybeast12/opencode-instincts#readme",
+  "author": "Firat Honca",
+  "license": "MIT"
+}
