@@ -309,8 +309,17 @@ function createPluginHarness(directory, options) {
   assert.equal(generateCalls, 0, "observer does not run below minObservations");
 
   await appendObservation(project, { event: "tool_start", tool: "edit", session: "obs-session", agent: "build", project_id: project.id, project_name: project.name, input: "edit 2" });
-  // Hooks fire concurrently; three overlapping triggers must produce one run.
-  await Promise.all([observer.maybeRun("obs-session"), observer.maybeRun("obs-session"), observer.maybeRun("obs-session")]);
+  // Hooks fire concurrently; three overlapping triggers must produce one
+  // run. A fresh observer instance for this check: `observer`'s own
+  // per-instance, 30s line-count throttle (F1, lib/observer.js) would
+  // otherwise still be holding the stale 2-line count it read a moment ago
+  // in the assertion above, masking the observation just appended.
+  const thresholdObserver = createObserver(ctx, options);
+  await Promise.all([
+    thresholdObserver.maybeRun("obs-session"),
+    thresholdObserver.maybeRun("obs-session"),
+    thresholdObserver.maybeRun("obs-session"),
+  ]);
   assert.equal(generateCalls, 1, "observer runs once the threshold is met, and only once under concurrent triggers");
 
   const writtenFiles = await fs.readdir(project.instincts_personal);
@@ -330,25 +339,69 @@ function createPluginHarness(directory, options) {
   assert.equal(notice.delivery, "queue");
   assert.ok(notice.text.includes("1 written, 3 rejected"), "notify summary matches the log line");
 
+  // The run above just wrote lastRunAt into .observer-state.json; a fresh
+  // observer instance for the same project must now reject on the interval
+  // gate alone (F1) without ever reading, let alone re-counting, the
+  // observations file.
+  const gatedObserver = createObserver(ctx, options);
+  assert.equal(gatedObserver._countLineReads(), 0, "fresh observer instance starts with zero observation-file reads");
+  await gatedObserver.maybeRun("obs-session");
+  assert.equal(generateCalls, 1, "interval gate rejects the run without calling generate.text again");
+  assert.equal(gatedObserver._countLineReads(), 0, "interval gate short-circuits before counting observation lines");
+
   // -------------------------------------------------------------------------
   // 3. cli.js argv/path allowlists, reusing this project so the final
   //    real-CLI call can report the instinct this test just wrote.
   // -------------------------------------------------------------------------
-  const pathEscape = await runCli(project, options, "export", "--output ../escape.yaml", { directory: projectDir });
+  const pathEscape = await runCli(options, "export", "--output ../escape.yaml", { directory: projectDir });
   assert.ok(pathEscape.includes("escapes the project directory"), `export --output path traversal rejected: ${pathEscape}`);
 
-  const unknownFlag = await runCli(project, options, "status", "--not-a-real-flag", { directory: projectDir });
+  const repeatedFlag = await runCli(options, "export", "--output a.yaml --output b.yaml", { directory: projectDir });
+  assert.ok(repeatedFlag.includes("given more than once"), `repeated flag rejected: ${repeatedFlag}`);
+
+  const unknownFlag = await runCli(options, "status", "--not-a-real-flag", { directory: projectDir });
   assert.ok(unknownFlag.includes("Flag not permitted"), `unknown flag rejected: ${unknownFlag}`);
 
-  const unknownAction = await runCli(project, options, "nuke", "", { directory: projectDir });
+  const unknownAction = await runCli(options, "nuke", "", { directory: projectDir });
   assert.ok(unknownAction.includes("Unknown instincts action"), `unknown action rejected: ${unknownAction}`);
 
-  const noProjectsSubcommand = await runCli(project, options, "projects", "delete some-id --force", { directory: projectDir });
+  const noProjectsSubcommand = await runCli(options, "projects", "delete some-id --force", { directory: projectDir });
   assert.ok(noProjectsSubcommand.toLowerCase().includes("not permitted"), `projects delete/merge/gc unreachable: ${noProjectsSubcommand}`);
 
-  const statusOutput = await runCli(project, options, "status", "", { directory: projectDir });
+  const statusOutput = await runCli(options, "status", "", { directory: projectDir });
   assert.ok(statusOutput.includes("prefer-functional-components"), "real instinct-cli.py status reports the instinct this test wrote");
   assert.ok(statusOutput.includes("2 total"), `instinct-cli.py count agrees with what this test wrote (1 personal + 1 inherited): ${statusOutput}`);
+}
+
+// ---------------------------------------------------------------------------
+// 4. project.js: concurrent first resolveProject calls for a directory with
+//    no cache entry yet share one in-flight resolution (F6), i.e. spawn one
+//    python subprocess rather than one per caller. Counted by pointing
+//    options.python at a wrapper script (under the scratch root) that
+//    tallies its own invocations before exec'ing the real interpreter.
+// ---------------------------------------------------------------------------
+{
+  const { projectDir, dataDir } = makeProjectAndData("concurrent-resolve");
+  const spawnCountFile = path.join(path.dirname(projectDir), "spawn-count");
+  fsSync.writeFileSync(spawnCountFile, "");
+  const countingPython = path.join(path.dirname(projectDir), "counting-python.sh");
+  fsSync.writeFileSync(countingPython, `#!/bin/sh\necho x >> '${spawnCountFile}'\nexec python3 "$@"\n`);
+  fsSync.chmodSync(countingPython, 0o755);
+
+  const options = { python: countingPython, dataDir };
+  const ctx = { location: { directory: projectDir } };
+
+  const results = await Promise.all([
+    resolveProject(ctx, options),
+    resolveProject(ctx, options),
+    resolveProject(ctx, options),
+  ]);
+  assert.ok(
+    results.every((info) => info.id === results[0].id),
+    "all concurrent first-time resolveProject calls for the same directory resolve to the same project",
+  );
+  const spawnCount = (await fs.readFile(spawnCountFile, "utf8")).split("\n").filter((line) => line.trim().length > 0).length;
+  assert.equal(spawnCount, 1, "concurrent first resolveProject calls for one directory share a single python subprocess");
 }
 
 function buildFakeObserverOutput() {

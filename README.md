@@ -57,7 +57,7 @@ All options are optional; defaults shown:
 | Option | Description |
 | --- | --- |
 | `disabled` | Skip registering everything (hooks, commands, tool). |
-| `dataDir` | Absolute path to use instead of the default ECC data directory. Maps to `CLV2_HOMUNCULUS_DIR` for the vendored CLI. |
+| `dataDir` | Absolute path to use instead of the default ECC data directory; relative values are ignored with a warning. Maps to `CLV2_HOMUNCULUS_DIR` for the vendored CLI. |
 | `python` | Python interpreter to run `instinct-cli.py` with. |
 | `observePrompts` | Record user prompt text (scrubbed, clipped to 2000 chars) as `user_prompt` observations. |
 | `ignoreTools` / `ignoreAgents` | Tool names / agent names to never observe. |
@@ -83,7 +83,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
         └── inherited/<id>.md       # written by `/instinct-import`
 ```
 
-Project identity (the `<project-hash>` above, or the shared `global` bucket when there is no git project) is resolved by calling ECC's own `detect_project()` in `vendor/ecc/instinct-cli.py`, so this plugin and the CLI can never disagree about which project a given directory is.
+Project identity (the `<project-hash>` above, or the shared `global` bucket when there is no git project) is resolved by calling ECC's own `detect_project()` in `vendor/ecc/instinct-cli.py`, so this plugin and the CLI agree unless resolution fails, in which case a warning is logged and the shared global bucket is used.
 
 ## Commands
 
