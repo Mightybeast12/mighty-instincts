@@ -89,26 +89,38 @@ All options are optional; defaults shown:
 
 The board is a small, read-only summary of three sources, written by the server half of the plugin to a per-project `board-state.json` file and polled every 30 seconds (or refreshed on request) by the TUI sidebar panel and by `/board`:
 
-- **Instincts**: this plugin's own project/inherited/global instinct counts, when the observer last ran, how many observations are pending, and when the observer is next eligible to run.
-- **Skill observations**: the task-observer skill's open/parked observation counts, the last backlog review date, and how many staged skill updates are still pending.
-- **Skill evals**: the newest benchmark the skill-creator skill produced (skill name, iteration, and the two pass rates it compared).
+- **Instincts**: how many instincts this plugin has learned (project + inherited + global), how many of those look ready to promote (confidence >= 0.8), their domains, and the observer's run/written/rejected tally plus when it next runs.
+- **Skill observations**: the task-observer skill's open backlog count and last review date, the busiest skills in that backlog, and how recently observations were added.
+- **Skill evals**: the newest benchmark the skill-creator skill produced (skill name, iteration, age, run count, and the two pass rates it compared).
 
-Each block is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts block is always this plugin's own data).
+Each block is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts block is always this plugin's own data). The Skill observations block also shows a `!` warning glyph on its first line when the open backlog is large (over 100) and has gone unreviewed (never, or more than 7 days ago).
 
 In the sidebar, the panel header and every block title are clickable: the header collapses the whole panel down to that one line, and a block title collapses just that block down to its title line. Both default to expanded (`board.compact: true` starts blocks collapsed instead); whichever state you leave them in is remembered across restarts. Fully expanded, the panel reads:
 
 ```
 ▾ Mighty Instincts
-▾ Instincts · haiku observer
-  5 learned here, 0 global
-  next run in 3m, 14 new events
-▾ Skill observations · task-observer
-  308 open, 2 parked
-  last review 3d ago, 1 staged
-▾ Skill evals · skill-creator
-  pr, iteration 2
-  92% with skill, 8% without
+  ▾ Instincts · haiku observer
+    9 learned, 4 ready to promote
+    workflow 6 · tooling 2 · tool-usage 1
+    12 runs, 19 written, 0 rejected · next 3m
+  ▾ Skill observations · task-observer
+  ! 398 open, review never
+    verification-planning 260 · programming 38
+    +43 today, +158 this week · newest 2h
+  ▾ Skill evals · skill-creator
+    pr, iteration 2 · 2d old, n=4
+    92% with skill, 8% without
 ```
+
+### Detail panel
+
+Clicking any fact line (not the title row) opens a companion detail panel for that block, showing everything the three-line summary leaves out:
+
+- **Instincts**: every instinct, sorted by confidence descending, as `id`, a 10-cell `████████░░`-style confidence bar, and its domain, followed by the last 5 lines of `observer.log`.
+- **Skill observations**: every skill named in the open backlog with its count (not just the top 3), then the 10 newest observations by title and age.
+- **Skill evals**: skill, benchmark path, timestamp, both pass rates with their standard deviation when reported, and the first failing expectation's text and evidence.
+
+The same panel can be opened without clicking, through the global `/instincts-detail` command, for hosts whose command palette is preferred over the mouse. Both the detail panel and the command are registered defensively: a host whose `ctx.ui` has no `.panel`, or whose `ctx.keymap` has no `.layer`, simply never sees either one claimed, and the rest of the board (the three-line summaries, `/board`) is unaffected.
 
 ### Where the board state lives
 
@@ -119,7 +131,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     └── board-state.json
 ```
 
-The TUI half knows the real project directory (`ctx.location.directory`) but not `<project-hash>` (ECC's own git-remote hash, resolved by a python subprocess the server half already runs). So the server half also writes a small pointer file, named only from a hash of the real directory path, holding the absolute path of the real state file. Both halves resolve the pointer file's own location the same way (the ECC data directory default chain above), so the TUI never needs to run python itself.
+The TUI half knows the real project directory (`ctx.location.directory`) but not `<project-hash>` (ECC's own git-remote hash, resolved by a python subprocess the server half already runs). So the server half also writes a small pointer file, named only from a hash of the real directory path, holding the absolute path of the real state file. Both halves resolve the pointer file's own location the same way (the ECC data directory default chain above), so the TUI never needs to run python itself. The detail panel's `observer.log` tail is read the same way: straight off disk, next to `board-state.json`, rather than duplicated into the state file.
 
 ## What gets written, and where
 
@@ -138,6 +150,8 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
         └── inherited/<id>.md       # written by `/instinct-import`
 ```
 
+`observer.log` carries one line per run: `<iso> run: <N> written, <N> rejected, model <provider/model>`, with ` ids: <id>,<id>,...` appended when any instinct was written and ` rejected: <reason>; <reason>; ...` appended when any block was rejected. Both suffixes are for the detail panel's raw log tail (and anyone reading the file by hand); the board only ever parses the fixed `run: N written, N rejected, model ` prefix, so older log lines without the suffixes still parse the same way.
+
 Project identity (the `<project-hash>` above, or the shared `global` bucket when there is no git project) is resolved by calling ECC's own `detect_project()` in `vendor/ecc/instinct-cli.py`, so this plugin and the CLI agree unless resolution fails, in which case a warning is logged and the shared global bucket is used.
 
 ## Commands
@@ -153,8 +167,9 @@ Project identity (the `<project-hash>` above, or the shared `global` bucket when
 | `/instinct-prune [--dry-run] [--max-age N]` | Delete pending instincts older than the TTL. |
 | `/instinct-observe` | Run the observer right now, ignoring the enabled/interval/threshold gates. |
 | `/board` | Show the board summary as plain text (Instincts, Skill observations, Skill evals). |
+| `/instincts-detail` | (OpenCode 2 TUI only) Open the board's detail panel - the same panel a fact-line click opens. |
 
-Every command runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
+Every command above `/instincts-detail` runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt. `/instincts-detail` is different: it is registered by the TUI companion (`sidebar.js`, through `ctx.keymap.layer`) rather than the server half, opens a UI panel instead of posting a message, and is only available where the host offers that keymap surface.
 
 ## The `instincts` tool
 
