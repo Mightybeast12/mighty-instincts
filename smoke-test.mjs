@@ -43,11 +43,17 @@ async function readJsonLines(file) {
 // Mirrors the registration/transform/hook shapes mighty-reviewer's smoke
 // test fakes for the same V2 ctx surface, scoped to what this plugin uses:
 // tool.hook, tool.transform, session.hook, session.synthetic/prompt,
-// command.transform.
+// command.transform. session.hook accumulates every registration under
+// its event name (0.6.0 registers two independent "prompt" hooks: the
+// observer's in lib/observe.js and injection's in lib/inject.js, exactly
+// as a real host would from two separate ctx.session.hook("prompt", ...)
+// calls); `sessionHooks[name]` exposes them composed into one callable
+// (undefined when nothing registered for that name), mirroring how a real
+// host presumably runs every hook registered for the same event in turn.
 function createPluginHarness(directory, options) {
   const registrations = [];
   const toolHooks = {};
-  const sessionHooks = {};
+  const sessionHookLists = {};
   const commandDefs = [];
   const toolDefs = [];
   const syntheticCalls = [];
@@ -74,7 +80,7 @@ function createPluginHarness(directory, options) {
     },
     session: {
       hook: async (name, cb) => {
-        sessionHooks[name] = cb;
+        (sessionHookLists[name] ??= []).push(cb);
         return makeRegistration();
       },
       synthetic: async (input) => {
@@ -100,7 +106,17 @@ function createPluginHarness(directory, options) {
     },
   };
 
-  return { ctx, registrations, toolHooks, sessionHooks, commandDefs, toolDefs, syntheticCalls, promptCalls };
+  const sessionHooks = {
+    get prompt() {
+      const list = sessionHookLists.prompt;
+      if (!list || list.length === 0) return undefined;
+      return async (event) => {
+        for (const cb of list) await cb(event);
+      };
+    },
+  };
+
+  return { ctx, registrations, toolHooks, sessionHooks, sessionHookLists, commandDefs, toolDefs, syntheticCalls, promptCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +230,46 @@ function createPluginHarness(directory, options) {
   const clippedLine = lines.find((line) => line.tool === "write");
   assert.ok(clippedLine.input.length <= 5000, "oversized input clipped to 5000 chars");
 
-  // observePrompts: false must skip registering the prompt hook entirely.
+  // observePrompts: false must skip registering observe.js's own prompt
+  // hook, but lib/inject.js registers its own "prompt" hook independently
+  // (inject.enabled defaults to true, unrelated to observePrompts): with
+  // both off, no prompt hook at all is registered; with only
+  // observePrompts off, exactly one (injection's) is, and it never
+  // appends an observation.
   const { projectDir: noPromptDir, dataDir: noPromptData } = makeProjectAndData("no-prompt");
-  const noPromptHarness = createPluginHarness(noPromptDir, { python: "python3", dataDir: noPromptData, observePrompts: false, board: { enabled: false } });
+  const noPromptHarness = createPluginHarness(noPromptDir, {
+    python: "python3",
+    dataDir: noPromptData,
+    observePrompts: false,
+    inject: { enabled: false },
+    board: { enabled: false },
+  });
   const noPromptCleanup = await setup(noPromptHarness.ctx);
-  assert.equal(noPromptHarness.sessionHooks.prompt, undefined, "prompt hook not registered when observePrompts is false");
+  assert.equal(
+    noPromptHarness.sessionHooks.prompt,
+    undefined,
+    "no prompt hook at all when both observePrompts and inject.enabled are false",
+  );
   await noPromptCleanup();
+
+  const { projectDir: injectOnlyDir, dataDir: injectOnlyData } = makeProjectAndData("no-observe-prompts");
+  const injectOnlyHarness = createPluginHarness(injectOnlyDir, {
+    python: "python3",
+    dataDir: injectOnlyData,
+    observePrompts: false,
+    board: { enabled: false },
+  });
+  const injectOnlyCleanup = await setup(injectOnlyHarness.ctx);
+  assert.equal(
+    injectOnlyHarness.sessionHookLists.prompt?.length,
+    1,
+    "with observePrompts off, only injection's prompt hook is registered",
+  );
+  const injectOnlyProject = await resolveProject(injectOnlyHarness.ctx, { python: "python3", dataDir: injectOnlyData });
+  await injectOnlyHarness.sessionHooks.prompt({ sessionID: "s2", metadata: {}, prompt: { text: "anything at all" } });
+  const injectOnlyLines = await readJsonLines(injectOnlyProject.observations_file).catch(() => []);
+  assert.equal(injectOnlyLines.length, 0, "with observePrompts off, a prompt still never becomes a user_prompt observation");
+  await injectOnlyCleanup();
 
   // /instinct-status runs the CLI directly and posts a synthetic reply;
   // it must never go through ctx.session.prompt.
@@ -609,6 +659,10 @@ function createPluginHarness(directory, options) {
     ],
     "instincts.list sorted by confidence desc, for the detail panel",
   );
+  assert.deepEqual(state.instincts.list.map((inst) => inst.fired), [0, 0, 0], "fired defaults to 0 when the frontmatter field is absent");
+  assert.equal(state.instincts.lastWriteAt, "2026-10-02T00:00:00.000Z", "lastWriteAt is the timestamp of the most recent run line with written > 0");
+  assert.equal(state.instincts.lastObservedAt, null, "no .activity.json written in this fixture, so lastObservedAt stays null");
+  assert.equal(state.instincts.appliedToday, 0, "no .activity.json written in this fixture, so appliedToday stays 0");
 
   assert.equal(state.observations.available, true);
   assert.equal(state.observations.open, 3, "two explicit opens plus the file with no status line");
@@ -950,6 +1004,239 @@ function createPluginHarness(directory, options) {
   const mergedFromObject = mergeInteractionState(compact, { blocks: { evals: true } });
   assert.equal(mergedFromObject.panelOpen, true, "mergeInteractionState also accepts an already-parsed object, not just a JSON string");
   assert.deepEqual(mergedFromObject.blocks, { instincts: false, observations: false, evals: true }, "merging over a compact-seeded default only changes the one block the snapshot named");
+}
+
+// ---------------------------------------------------------------------------
+// 10. lib/activity.js: recordObserved always flushes on its first call for
+//     a project, then throttles to at most once per 10s; recordApplied's
+//     writes are never throttled and never clobber lastObservedAt;
+//     readActivitySnapshot always reads straight from disk and is
+//     date-scoped (a stale appliedDate reads as 0 "today").
+// ---------------------------------------------------------------------------
+{
+  const { recordObserved, recordApplied, readActivitySnapshot } = await import("./lib/activity.js");
+
+  const { projectDir } = makeProjectAndData("activity");
+  await fs.mkdir(projectDir, { recursive: true });
+
+  const before = await readActivitySnapshot(projectDir);
+  assert.equal(before.lastObservedAt, null, "no .activity.json yet: lastObservedAt starts null");
+  assert.equal(before.appliedToday, 0, "no .activity.json yet: appliedToday starts 0");
+
+  await recordObserved(projectDir);
+  const firstWrite = JSON.parse(await fs.readFile(path.join(projectDir, ".activity.json"), "utf8"));
+  assert.ok(typeof firstWrite.lastObservedAt === "string" && !Number.isNaN(Date.parse(firstWrite.lastObservedAt)), "the first recordObserved call always flushes to disk");
+
+  await recordObserved(projectDir); // immediate second call, still inside the 10s throttle window
+  const secondWrite = JSON.parse(await fs.readFile(path.join(projectDir, ".activity.json"), "utf8"));
+  assert.equal(secondWrite.lastObservedAt, firstWrite.lastObservedAt, "a second call inside the 10s throttle window does not flush again");
+
+  await recordApplied(projectDir, 2);
+  await recordApplied(projectDir, 3);
+  const afterApplied = await readActivitySnapshot(projectDir);
+  assert.equal(afterApplied.appliedToday, 5, "recordApplied accumulates within the same day");
+  // recordObserved updates its in-memory lastObservedAt on every call,
+  // even a throttled one that skips its own disk flush; recordApplied's
+  // own write flushes the shared in-memory state as a whole, so the
+  // on-disk lastObservedAt after it legitimately reflects that latest
+  // in-memory value, not necessarily the exact string from firstWrite.
+  // What it must never do is drop or null out the field.
+  assert.ok(
+    typeof afterApplied.lastObservedAt === "string" && !Number.isNaN(Date.parse(afterApplied.lastObservedAt)),
+    "recordApplied's writes never clobber lastObservedAt with null/undefined",
+  );
+  assert.ok(Date.parse(afterApplied.lastObservedAt) >= Date.parse(firstWrite.lastObservedAt), "lastObservedAt never moves backwards");
+
+  // A stale appliedDate (e.g. from before midnight UTC) must read as 0 for
+  // "today" rather than passed through as-is.
+  const activityPath = path.join(projectDir, ".activity.json");
+  const stale = JSON.parse(await fs.readFile(activityPath, "utf8"));
+  stale.appliedDate = "2000-01-01";
+  stale.appliedToday = 99;
+  await fs.writeFile(activityPath, JSON.stringify(stale), "utf8");
+  const afterStaleDate = await readActivitySnapshot(projectDir);
+  assert.equal(afterStaleDate.appliedToday, 0, "appliedToday from a different (stale) date reads as 0 for today");
+}
+
+// ---------------------------------------------------------------------------
+// 11. lib/inject.js pure functions: candidate selection (confidence
+//     filter, inject.exclude, malformed-trigger skip, sort, max cap), the
+//     1200-char injected-block budget (dropping the lowest-confidence
+//     entry first), and the significant-word overlap the fired-count
+//     bump is keyed on.
+// ---------------------------------------------------------------------------
+{
+  const { selectForInjection, formatInjectionBlock, significantWords, sharedSignificantWordCount, DEFAULT_INJECT_OPTIONS } = await import(
+    "./lib/inject.js"
+  );
+
+  assert.deepEqual(DEFAULT_INJECT_OPTIONS, { enabled: true, max: 5, minConfidence: 0.8, exclude: [] });
+
+  const pool = [
+    { id: "a", trigger: "alpha trigger", confidence: 0.95 },
+    { id: "b", trigger: "beta trigger", confidence: 0.9 },
+    { id: "c", trigger: "gamma trigger", confidence: 0.85 },
+    { id: "d", trigger: "delta trigger", confidence: 0.81 },
+    { id: "e", trigger: "epsilon trigger", confidence: 0.8 },
+    { id: "f", trigger: "zeta trigger", confidence: 0.79 }, // below minConfidence
+  ];
+
+  const selected = selectForInjection(pool, { max: 5, minConfidence: 0.8 });
+  assert.deepEqual(selected.map((inst) => inst.id), ["a", "b", "c", "d", "e"], "qualifying instincts, sorted by confidence desc, capped at max");
+
+  const capped = selectForInjection(pool, { max: 2, minConfidence: 0.8 });
+  assert.deepEqual(capped.map((inst) => inst.id), ["a", "b"], "max caps the selection even when more instincts qualify");
+
+  const excluded = selectForInjection(pool, { max: 5, minConfidence: 0.8, exclude: ["b", "d"] });
+  assert.deepEqual(excluded.map((inst) => inst.id), ["a", "c", "e"], "inject.exclude removes ids before sorting/capping");
+
+  assert.deepEqual(selectForInjection([], {}), [], "an empty pool selects nothing");
+
+  let malformedCalls = 0;
+  const poolWithMalformed = [
+    ...pool,
+    { id: "bad-conf", trigger: "do this when confidence: 0.9 shows up", confidence: 0.99 },
+    { id: "bad-domain", trigger: "note the domain: tooling marker", confidence: 0.98 },
+  ];
+  const withMalformed = selectForInjection(poolWithMalformed, { max: 10, minConfidence: 0.8 }, { onMalformed: () => { malformedCalls += 1; } });
+  assert.ok(
+    !withMalformed.some((inst) => inst.id === "bad-conf" || inst.id === "bad-domain"),
+    "a trigger containing a 'confidence:'/'domain:' pair is treated as malformed and skipped",
+  );
+  assert.equal(malformedCalls, 2, "onMalformed is called once per skipped malformed candidate");
+
+  const smallEntries = [
+    { id: "a", trigger: "alpha trigger", line: "do the alpha thing" },
+    { id: "b", trigger: "beta trigger", line: "do the beta thing" },
+  ];
+  const smallBlock = formatInjectionBlock(smallEntries);
+  assert.ok(smallBlock.text.startsWith("<instincts>\n") && smallBlock.text.endsWith("\n</instincts>"), "block is wrapped in <instincts>/</instincts>");
+  assert.ok(smallBlock.text.includes("- alpha trigger: do the alpha thing"), "each line is '- <trigger>: <line>'");
+  assert.deepEqual(smallBlock.ids, ["a", "b"]);
+  assert.ok(smallBlock.text.length <= 1200);
+
+  const longLine = "x".repeat(500);
+  const oversizedEntries = [
+    { id: "big1", trigger: "t1", line: longLine },
+    { id: "big2", trigger: "t2", line: longLine },
+    { id: "big3", trigger: "t3", line: longLine },
+  ];
+  const trimmedBlock = formatInjectionBlock(oversizedEntries);
+  assert.ok(trimmedBlock.text.length <= 1200, "the block is trimmed to stay under the 1200-char budget");
+  assert.ok(!trimmedBlock.ids.includes("big3"), "the lowest-confidence (last, assuming callers pass entries sorted desc) entry is dropped first");
+
+  const singleOversized = formatInjectionBlock([{ id: "huge", trigger: "t", line: "y".repeat(2000) }]);
+  assert.equal(singleOversized, null, "formatInjectionBlock returns null when even a single entry cannot fit the budget");
+
+  assert.deepEqual(
+    [...significantWords("Grep before editing unfamiliar files")].sort(),
+    ["editing", "files", "unfamiliar"].sort(),
+    "words under 5 letters ('grep') and stopwords ('before') are excluded",
+  );
+  assert.equal(
+    sharedSignificantWordCount("grep unfamiliar repository before editing", "please grep this unfamiliar repository before editing anything"),
+    3,
+    "shared significant words: unfamiliar, repository, editing",
+  );
+  assert.equal(
+    sharedSignificantWordCount("totally unrelated trigger text", "please grep this unfamiliar repository before editing anything"),
+    0,
+    "no shared significant words",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 12. lib/observe.js's stripInjectedBlock: removes exactly the injected
+//     <instincts>...</instincts> block (and the blank line(s) injection
+//     adds before it), so the observer only ever logs/distils what the
+//     user actually typed.
+// ---------------------------------------------------------------------------
+{
+  const { stripInjectedBlock } = await import("./lib/observe.js");
+
+  const injected = "fix the flaky test\n\n<instincts>\n- grep before edit: search first\n- another one: do the thing\n</instincts>";
+  assert.equal(stripInjectedBlock(injected), "fix the flaky test", "the injected block and the blank line before it are removed");
+
+  const noBlock = "just a normal prompt with no injection";
+  assert.equal(stripInjectedBlock(noBlock), noBlock, "a prompt with no injected block is returned unchanged");
+
+  const multiline = "first line\nsecond line\n\n<instincts>\n- a: b\n</instincts>\n";
+  assert.equal(stripInjectedBlock(multiline), "first line\nsecond line", "trailing newlines after the block are also removed");
+}
+
+// ---------------------------------------------------------------------------
+// 13. lib/inject.js live wiring: registerInject's session.hook("prompt")
+//     actually appends the <instincts> block for qualifying instincts
+//     only, sets event.metadata.mightyInstincts, counts the injection in
+//     .activity.json, bumps `fired` on the matching instinct's own
+//     frontmatter, and skips entirely for a loop re-prompt, a ulw
+//     re-prompt, or a prompt already carrying mightyInstincts metadata.
+// ---------------------------------------------------------------------------
+{
+  const { registerInject } = await import("./lib/inject.js");
+
+  const { projectDir, dataDir } = makeProjectAndData("inject-live");
+  const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+  const hooks = {};
+  const ctx = {
+    location: { directory: projectDir },
+    session: {
+      hook: async (name, cb) => {
+        hooks[name] = cb;
+        return { dispose: async () => {} };
+      },
+    },
+  };
+
+  const project = await resolveProject(ctx, options);
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+    "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+  );
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "low-confidence", trigger: "something else entirely", confidence: 0.4, domain: "misc" },
+    "# Low Confidence\n\n## Action\nShould never be injected.\n",
+  );
+
+  await registerInject(ctx, options);
+  assert.equal(typeof hooks.prompt, "function", "registerInject registered a session.hook('prompt') callback");
+
+  const event = { sessionID: "inject-s1", metadata: {}, prompt: { text: "please grep this unfamiliar repository before editing anything" } };
+  await hooks.prompt(event);
+
+  assert.ok(event.prompt.text.includes("<instincts>"), "prompt text gained the injected block");
+  assert.ok(event.prompt.text.includes("grep unfamiliar repository before editing"), "injected block carries the qualifying instinct's trigger");
+  assert.ok(!event.prompt.text.includes("something else entirely"), "the below-threshold instinct was never selected for injection");
+  assert.deepEqual(event.metadata.mightyInstincts, { injected: ["grep-before-edit"] }, "metadata records exactly the injected id");
+
+  const activity = JSON.parse(await fs.readFile(path.join(project.project_dir, ".activity.json"), "utf8"));
+  assert.equal(activity.appliedToday, 1, "one injection counted for today in .activity.json");
+
+  const writtenContent = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+  assert.ok(/fired:\s*1/.test(writtenContent), "fired bumped to 1: the prompt shares 3+ significant words with the trigger");
+
+  const loopEvent = { sessionID: "inject-s1", metadata: { opencode_loop_v2: true }, prompt: { text: "grep the repository before editing" } };
+  await hooks.prompt(loopEvent);
+  assert.ok(!loopEvent.prompt.text.includes("<instincts>"), "a loop re-prompt (opencode_loop_v2 metadata) is never injected into");
+
+  const ulwEvent = { sessionID: "inject-s1", metadata: { ulw: "active" }, prompt: { text: "grep the repository before editing" } };
+  await hooks.prompt(ulwEvent);
+  assert.ok(!ulwEvent.prompt.text.includes("<instincts>"), "a ulw re-prompt (ulw metadata) is never injected into");
+
+  const alreadyInjected = { sessionID: "inject-s1", metadata: { mightyInstincts: { injected: ["x"] } }, prompt: { text: "grep the repository before editing" } };
+  await hooks.prompt(alreadyInjected);
+  assert.ok(!alreadyInjected.prompt.text.includes("<instincts>"), "a prompt already carrying mightyInstincts metadata is never re-injected");
+
+  // fired must not bump again on a prompt that shares no significant
+  // words with the trigger, even though the instinct still qualifies and
+  // gets injected.
+  const unrelatedEvent = { sessionID: "inject-s1", metadata: {}, prompt: { text: "please summarise the quarterly numbers" } };
+  await hooks.prompt(unrelatedEvent);
+  assert.ok(unrelatedEvent.prompt.text.includes("<instincts>"), "the instinct is still injected even when unrelated to the prompt");
+  const contentAfterUnrelated = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+  assert.ok(/fired:\s*1/.test(contentAfterUnrelated), "fired stays at 1: an unrelated prompt never bumps it");
 }
 
 function buildFakeObserverOutput() {

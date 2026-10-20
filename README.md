@@ -1,6 +1,6 @@
 # mighty-instincts
 
-An [OpenCode](https://opencode.ai) V2 plugin that observes session activity (tool calls and prompts) into a per-project log, periodically has a cheap model distil that log into small learned "instincts," and exposes [ECC](https://github.com/affaan-m/ECC)'s instinct CLI as slash commands. Nothing becomes live on its own: `/evolve` only writes inert markdown, the observer is off by default, and the plugin never injects instincts into a prompt.
+An [OpenCode](https://opencode.ai) V2 plugin that observes session activity (tool calls and prompts) into a per-project log, periodically has a cheap model distil that log into small learned "instincts," and exposes [ECC](https://github.com/affaan-m/ECC)'s instinct CLI as slash commands. Nothing becomes live automatically on the write side: `/evolve` only writes inert markdown, and the observer is off by default. On the read side, the plugin injects a small `<instincts>` block into outgoing prompts by default (`inject.enabled: true`); this costs no model call of its own, since it only reads instinct files this plugin (or `/instinct-import`) already wrote.
 
 On the OpenCode 2 TUI it also adds a small, collapsible sidebar board summarising three sources of the user's own observation/improvement tooling: **Instincts** (this plugin's own counts and observer status), **Skill observations** (the task-observer skill's open/parked backlog and staged updates), and **Skill evals** (skill-creator's latest benchmark result). Hosts without the sidebar can run `/board` for the same summary as plain text.
 
@@ -55,6 +55,12 @@ All options are optional; defaults shown:
     "maxAnalysisLines": 300,
     "notify": true
   },
+  "inject": {
+    "enabled": true,
+    "max": 5,
+    "minConfidence": 0.8,
+    "exclude": []
+  },
   "board": {
     "enabled": true,
     "sections": { "instincts": true, "observations": true, "evals": true },
@@ -78,6 +84,10 @@ All options are optional; defaults shown:
 | `observer.runIntervalMinutes` / `observer.minObservations` | Minimum time and minimum new observation count between automatic runs. |
 | `observer.maxAnalysisLines` | How many of the most recent observation lines to show the model per run. |
 | `observer.notify` | Post a synthetic summary message into the triggering session after a background run. |
+| `inject.enabled` | Append a small `<instincts>` block (trigger + a one-line gist of each instinct's `## Action` section) to outgoing prompts. On by default; set to `false` to turn it off entirely. |
+| `inject.max` | Maximum number of instincts appended per prompt, highest confidence first. |
+| `inject.minConfidence` | Minimum confidence an instinct needs to be eligible for injection. |
+| `inject.exclude` | Array of instinct ids to never inject, even if they otherwise qualify. |
 | `board.enabled` | Turn the sidebar board and the `/board` command off entirely. |
 | `board.sections.instincts` / `.observations` / `.evals` | Show or hide one block of the board. |
 | `board.compact` | Start every board block collapsed to its title line only; still expandable by clicking. Does not affect the panel header. |
@@ -95,14 +105,16 @@ The board is a small, read-only summary of three sources, written by the server 
 
 Each block is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts block is always this plugin's own data). The Skill observations block also shows a `!` warning glyph on its first line when the open backlog is large (over 100) and has gone unreviewed (never, or more than 7 days ago).
 
-In the sidebar, the panel header and every block title are clickable: the header collapses the whole panel down to that one line, and a block title collapses just that block down to its title line. Both default to expanded (`board.compact: true` starts blocks collapsed instead); whichever state you leave them in is remembered across restarts. Fully expanded, the panel reads:
+In the sidebar, the panel header and every block title are clickable: the header collapses the whole panel down to that one line, and a block title collapses just that block down to its title line. Fact lines themselves are plain text (no further detail view). Both default to expanded (`board.compact: true` starts blocks collapsed instead); whichever state you leave them in is remembered across restarts. The header also shows the installed version (`Mighty Instincts v0.6.0`); the Instincts title pulses (`·`/`•`/`●`/`•`, cycling every 500ms) while an observation has landed in the last 60 seconds, and briefly switches to the success color for 5 seconds right after the observer writes a new instinct. Fully expanded, the panel reads:
 
 ```
-▾ Mighty Instincts
-  ▾ Instincts · haiku observer
+▾ Mighty Instincts v0.6.0
+  ▾ Instincts ● · haiku observer
     9 learned, 4 ready to promote
     workflow 6 · tooling 2 · tool-usage 1
     12 runs, 19 written, 0 rejected · next 3m
+    applied 2 today
+    learned prefer-functional-components 4m ago
   ▾ Skill observations · task-observer
   ! 398 open, review never
     verification-planning 260 · programming 38
@@ -111,16 +123,6 @@ In the sidebar, the panel header and every block title are clickable: the header
     pr, iteration 2 · 2d old, n=4
     92% with skill, 8% without
 ```
-
-### Detail panel
-
-Clicking any fact line (not the title row) opens a companion detail panel for that block, showing everything the three-line summary leaves out:
-
-- **Instincts**: every instinct, sorted by confidence descending, as `id`, a 10-cell `████████░░`-style confidence bar, and its domain, followed by the last 5 lines of `observer.log`.
-- **Skill observations**: every skill named in the open backlog with its count (not just the top 3), then the 10 newest observations by title and age.
-- **Skill evals**: skill, benchmark path, timestamp, both pass rates with their standard deviation when reported, and the first failing expectation's text and evidence.
-
-The same panel can be opened without clicking, through the global `/instincts-detail` command, for hosts whose command palette is preferred over the mouse. Both the detail panel and the command are registered defensively: a host whose `ctx.ui` has no `.panel`, or whose `ctx.keymap` has no `.layer`, simply never sees either one claimed, and the rest of the board (the three-line summaries, `/board`) is unaffected. Once the detail panel has focus, esc or q closes the panel, f toggles fullscreen.
 
 ### Where the board state lives
 
@@ -131,7 +133,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     └── board-state.json
 ```
 
-The TUI half knows the real project directory (`ctx.location.directory`) but not `<project-hash>` (ECC's own git-remote hash, resolved by a python subprocess the server half already runs). So the server half also writes a small pointer file, named only from a hash of the real directory path, holding the absolute path of the real state file. Both halves resolve the pointer file's own location the same way (the ECC data directory default chain above), so the TUI never needs to run python itself. The detail panel's `observer.log` tail is read the same way: straight off disk, next to `board-state.json`, rather than duplicated into the state file.
+The TUI half knows the real project directory (`ctx.location.directory`) but not `<project-hash>` (ECC's own git-remote hash, resolved by a python subprocess the server half already runs). So the server half also writes a small pointer file, named only from a hash of the real directory path, holding the absolute path of the real state file. Both halves resolve the pointer file's own location the same way (the ECC data directory default chain above), so the TUI never needs to run python itself.
 
 ## What gets written, and where
 
@@ -144,13 +146,14 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     ├── observations.archive/       # rotated out at 10 MB
     ├── observer.log                # plugin addition: one line per observer run
     ├── .observer-state.json        # plugin addition: last run time + line count for the gate
+    ├── .activity.json              # plugin addition: last-observed time + today's injection count
     ├── board-state.json            # plugin addition: the board's three-block summary
     └── instincts/
         ├── personal/<id>.md        # written by the observer
         └── inherited/<id>.md       # written by `/instinct-import`
 ```
 
-`observer.log` carries one line per run: `<iso> run: <N> written, <N> rejected, model <provider/model>`, with ` ids: <id>,<id>,...` appended when any instinct was written and ` rejected: <reason>; <reason>; ...` appended when any block was rejected. Both suffixes are for the detail panel's raw log tail (and anyone reading the file by hand); the board only ever parses the fixed `run: N written, N rejected, model ` prefix, so older log lines without the suffixes still parse the same way.
+`observer.log` carries one line per run: `<iso> run: <N> written, <N> rejected, model <provider/model>`, with ` ids: <id>,<id>,...` appended when any instinct was written and ` rejected: <reason>; <reason>; ...` appended when any block was rejected. Both suffixes are for anyone reading the file by hand; the board only ever parses the fixed `run: N written, N rejected, model ` prefix, so older log lines without the suffixes still parse the same way.
 
 Project identity (the `<project-hash>` above, or the shared `global` bucket when there is no git project) is resolved by calling ECC's own `detect_project()` in `vendor/ecc/instinct-cli.py`, so this plugin and the CLI agree unless resolution fails, in which case a warning is logged and the shared global bucket is used.
 
@@ -167,9 +170,8 @@ Project identity (the `<project-hash>` above, or the shared `global` bucket when
 | `/instinct-prune [--dry-run] [--max-age N]` | Delete pending instincts older than the TTL. |
 | `/instinct-observe` | Run the observer right now, ignoring the enabled/interval/threshold gates. |
 | `/board` | Show the board summary as plain text (Instincts, Skill observations, Skill evals). |
-| `/instincts-detail` | (OpenCode 2 TUI only) Open the board's detail panel - the same panel a fact-line click opens. |
 
-Every command above `/instincts-detail` runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt. `/instincts-detail` is different: it is registered by the TUI companion (`sidebar.js`, through `ctx.keymap.layer`) rather than the server half, opens a UI panel instead of posting a message, and is only available where the host offers that keymap surface.
+Every command above runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
 
 ## The `instincts` tool
 
@@ -186,10 +188,25 @@ When `observer.enabled` is `true`, every observed tool call or prompt checks whe
 
 This is at most one `generate.text` call per interval, on whatever model you set in `observer.model`. `/instinct-observe` runs the same logic on demand, bypassing the enabled/interval/threshold gates (it still needs a model, from `observer.model` or the host default).
 
+## Prompt injection
+
+When `inject.enabled` is `true` (the default), every outgoing prompt is checked against this project's instincts plus the shared global bucket. Up to `inject.max` instincts (default 5) meeting `inject.minConfidence` (default 0.8), excluding any id listed in `inject.exclude`, are appended to the prompt text as:
+
+```
+<instincts>
+- <trigger>: <first line of the instinct's ## Action section, or its title>
+...
+</instincts>
+```
+
+The whole block is kept under 1200 characters, dropping the lowest-confidence entries first if it would not otherwise fit. No model call is involved: this only reads instinct files already on disk. Injection is skipped when the prompt already carries this plugin's own `mightyInstincts` metadata (so a re-prompt is never injected twice), when it carries `opencode_loop_v2` or `ulw` metadata (a loop/ultrawork re-prompt, not a fresh request), or when the project has no instincts at all. A trigger that still contains a stray `confidence:` or `domain:` (frontmatter that leaked into the field) is treated as malformed and skipped, with a one-time warning logged.
+
+Each successful injection is counted in `.activity.json` (`appliedToday`, reset at UTC midnight) and shown on the board as `applied N today`. When an injected instinct's `trigger` shares at least 3 significant words (5+ letters, case-insensitive, common filler words removed) with the prompt that triggered it, that instinct's `fired` count (in its own frontmatter) is incremented; it is not currently shown anywhere in the sidebar, but is visible in the instinct file's own frontmatter. The observer never sees the injected block itself: it is stripped from the prompt text before that text is logged as a `user_prompt` observation, so distillation always runs on what the user actually typed.
+
 ## Privacy
 
 - Observations contain scrubbed tool inputs/outputs and prompt text (the same credential-redaction pattern ECC's shell hook uses), clipped to a few thousand characters each.
-- Everything stays on disk under the data directory above. Nothing is sent anywhere except the one `generate.text` call per observer run, which goes to whichever model you configured.
+- Everything stays on disk under the data directory above. Nothing is sent anywhere except the one `generate.text` call per observer run, which goes to whichever model you configured. Prompt injection never calls a model.
 - Only instincts (small learned patterns), never raw observations, can be exported with `/instinct-export`.
 - The board state file contains only counts, dates, and short status strings (no observation or finding text).
 
