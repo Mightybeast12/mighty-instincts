@@ -43,7 +43,7 @@
  */
 
 import { createElement, insert, setProp } from "@opentui/solid";
-import { createMemo, createSignal } from "solid-js";
+import { createMemo, createSignal, onCleanup } from "solid-js";
 import fs from "node:fs";
 import path from "node:path";
 import { pointerFilePath } from "./lib/board-pointer.js";
@@ -398,19 +398,56 @@ function registerDetailPanel(ctx, interaction) {
       append: "session.panel",
       render: (panel) => {
         if (panel?.name !== DETAIL_PANEL_NAME) return null;
+        setupPanelControls(ctx, panel);
         const view = createMemo(
           () => buildDetailView(ctx, interaction.selectedBlock()),
           null,
           { equals: (a, b) => JSON.stringify(a) === JSON.stringify(b) },
         );
         const root = box({ width: "100%", flexDirection: "column" });
-        insert(root, () => renderDetail(view(), palette(ctx.theme)));
+        insert(root, () => renderDetail(view(), palette(ctx.theme), panel));
         return root;
       },
     });
   } catch (error) {
     console.error(`[${PKG_NAME}] detail panel unavailable`, error);
     return undefined;
+  }
+}
+
+// Gives the detail panel keyboard escape/q close and an f fullscreen
+// toggle, plus input focus on first render, since the host documents
+// that a panel's keymap layers and input modes are active only while
+// the panel owns input, and nothing closes a panel unless the plugin
+// does. Guarded on both ctx.keymap.layer and panel.focus actually
+// existing: a host missing either surface just leaves the mouse hint
+// (and, for focus, one extra click) as the only way in.
+function setupPanelControls(ctx, panel) {
+  if (typeof ctx.keymap?.layer === "function") {
+    try {
+      const dispose = ctx.keymap.layer(() => ({
+        target: () => panel,
+        commands: [
+          { id: `${PKG_NAME}.panel.close`, bind: "escape", run: () => { panel.close(); } },
+          { id: `${PKG_NAME}.panel.close-q`, bind: "q", run: () => { panel.close(); } },
+          { id: `${PKG_NAME}.panel.fullscreen`, bind: "f", run: () => { panel.toggleFullscreen(); } },
+        ],
+      }));
+      if (typeof dispose === "function") {
+        try {
+          onCleanup(dispose);
+        } catch {
+          // onCleanup needs a reactive owner; harmless to skip without one.
+        }
+      }
+    } catch (error) {
+      console.error(`[${PKG_NAME}] detail panel keymap layer registration failed`, error);
+    }
+  }
+  try {
+    panel.focus?.();
+  } catch {
+    // Best-effort: a host without focus() just needs one extra click.
   }
 }
 
@@ -437,12 +474,43 @@ function buildDetailView(ctx, selected) {
 // Scrollable when the host's @opentui/solid build offers a "scrollbox"
 // element, plain (no scrolling) otherwise: feature-detected by trying to
 // create one, since there is no capability flag to check instead.
-function renderDetail(view, colors) {
+function renderDetail(view, colors, panel) {
   const container = tryCreate("scrollbox", { width: "100%", flexDirection: "column" }) ?? box({ width: "100%", flexDirection: "column" }, []);
+  insert(container, detailPanelHeader(colors, panel));
   for (const child of detailChildren(view, colors)) {
     if (child) insert(container, child);
   }
   return container;
+}
+
+// Title on the left, close/fullscreen hints on the right. The hints are
+// muted (not actionable-looking text) but clickable, mirroring the
+// keyboard bindings setupPanelControls registers: esc or q closes the
+// panel, f toggles fullscreen.
+function detailPanelHeader(colors, panel) {
+  return box({ width: "100%", flexDirection: "row", justifyContent: "space-between", paddingBottom: 1 }, [
+    text({ fg: colors.text, wrapMode: "none" }, ["Mighty Instincts detail"]),
+    box({ flexDirection: "row" }, [
+      panelHint("close (esc)", colors, () => panel.close()),
+      text({ fg: colors.muted, wrapMode: "none" }, ["  "]),
+      panelHint("fullscreen (f)", colors, () => panel.toggleFullscreen()),
+    ]),
+  ]);
+}
+
+// A muted, clickable hint (primary mouse button only, mirroring
+// clickableRow's guard).
+function panelHint(label, colors, onActivate) {
+  return box(
+    {
+      flexDirection: "row",
+      onMouseUp: (event) => {
+        if (event?.button !== undefined && event.button !== 0) return;
+        onActivate();
+      },
+    },
+    [text({ fg: colors.muted, wrapMode: "none" }, [label])],
+  );
 }
 
 function tryCreate(tag, props) {

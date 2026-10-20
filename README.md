@@ -120,7 +120,7 @@ Clicking any fact line (not the title row) opens a companion detail panel for th
 - **Skill observations**: every skill named in the open backlog with its count (not just the top 3), then the 10 newest observations by title and age.
 - **Skill evals**: skill, benchmark path, timestamp, both pass rates with their standard deviation when reported, and the first failing expectation's text and evidence.
 
-The same panel can be opened without clicking, through the global `/instincts-detail` command, for hosts whose command palette is preferred over the mouse. Both the detail panel and the command are registered defensively: a host whose `ctx.ui` has no `.panel`, or whose `ctx.keymap` has no `.layer`, simply never sees either one claimed, and the rest of the board (the three-line summaries, `/board`) is unaffected.
+The same panel can be opened without clicking, through the global `/instincts-detail` command, for hosts whose command palette is preferred over the mouse. Both the detail panel and the command are registered defensively: a host whose `ctx.ui` has no `.panel`, or whose `ctx.keymap` has no `.layer`, simply never sees either one claimed, and the rest of the board (the three-line summaries, `/board`) is unaffected. Once the detail panel has focus, esc or q closes the panel, f toggles fullscreen.
 
 ### Where the board state lives
 
