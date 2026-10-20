@@ -10,11 +10,22 @@ import os from "node:os";
 import path from "node:path";
 
 import { setup } from "./lib/plugin.js";
-import { createObserver } from "./lib/observer.js";
-import { resolveProject } from "./lib/project.js";
+import { createObserver, parseInstinctBlock } from "./lib/observer.js";
+import { resolveProject, siblingInstinctsDir } from "./lib/project.js";
 import { appendObservation, writeInstinct } from "./lib/store.js";
 import { runCli } from "./lib/cli.js";
 import { PKG_NAME } from "./lib/pkg.js";
+import {
+  MAINTENANCE_DEFAULTS,
+  classifyNewInstinct,
+  decayStep,
+  dedupeOrMerge,
+  evolveStep,
+  graduatePendingStep,
+  promoteStep,
+  pruneStep,
+  repairStep,
+} from "./lib/maintain.js";
 
 // os.tmpdir() resolves under /private/var/folders in the sandboxes this
 // plugin is developed in; nesting under opencode/instincts-test keeps every
@@ -44,12 +55,14 @@ async function readJsonLines(file) {
 // test fakes for the same V2 ctx surface, scoped to what this plugin uses:
 // tool.hook, tool.transform, session.hook, session.synthetic/prompt,
 // command.transform. session.hook accumulates every registration under
-// its event name (0.6.0 registers two independent "prompt" hooks: the
-// observer's in lib/observe.js and injection's in lib/inject.js, exactly
-// as a real host would from two separate ctx.session.hook("prompt", ...)
-// calls); `sessionHooks[name]` exposes them composed into one callable
-// (undefined when nothing registered for that name), mirroring how a real
-// host presumably runs every hook registered for the same event in turn.
+// its event name; 0.7.0 registers two independent session hooks under two
+// different *names*: observe.js's own "prompt" (observation) and
+// inject.js's "context" (injection, since 0.7.0 moved off "prompt" onto
+// the SessionContext hook so it never has to edit the user's own prompt
+// text). `sessionHooks[name]` exposes whichever of those is registered,
+// composed into one callable (undefined when nothing registered for that
+// name), mirroring how a real host presumably runs every hook registered
+// for the same event in turn.
 function createPluginHarness(directory, options) {
   const registrations = [];
   const toolHooks = {};
@@ -106,17 +119,39 @@ function createPluginHarness(directory, options) {
     },
   };
 
+  const composeHook = (name) => {
+    const list = sessionHookLists[name];
+    if (!list || list.length === 0) return undefined;
+    return async (event) => {
+      for (const cb of list) await cb(event);
+    };
+  };
   const sessionHooks = {
     get prompt() {
-      const list = sessionHookLists.prompt;
-      if (!list || list.length === 0) return undefined;
-      return async (event) => {
-        for (const cb of list) await cb(event);
-      };
+      return composeHook("prompt");
+    },
+    get context() {
+      return composeHook("context");
     },
   };
 
   return { ctx, registrations, toolHooks, sessionHooks, sessionHookLists, commandDefs, toolDefs, syntheticCalls, promptCalls };
+}
+
+// Builds a minimal SessionContext-shaped event (@opencode/plugin's
+// dist/promise/session.d.ts): the fields lib/inject.js's "context" hook
+// reads (`system`, `messages`) plus the ones every SessionContext always
+// carries (`sessionID`, `model`, `agent`, `tools`, `options`).
+function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraMessages = [] } = {}) {
+  return {
+    sessionID,
+    agent: "build",
+    model: { providerID: "fakeprov", id: "fakemodel" },
+    system,
+    messages: [...extraMessages, { role: "user", content: [{ type: "text", text: userText }] }],
+    tools: {},
+    options: {},
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +164,9 @@ function createPluginHarness(directory, options) {
   // Board refresh is unrelated to this section's assertions and would add
   // a real python subprocess call plus filesystem reads of the host's own
   // task-observer / skill-creator directories; disabled here and tested on
-  // its own, with controlled fixtures, in section 5 below.
+  // its own, with controlled fixtures, in section 6 below. Maintenance's
+  // own timer is harmless either way (see cleanup() below), but is also
+  // unrelated to these assertions.
   const options = { python: "python3", dataDir, board: { enabled: false } };
   const harness = createPluginHarness(projectDir, options);
 
@@ -137,7 +174,8 @@ function createPluginHarness(directory, options) {
   assert.equal(typeof cleanup, "function", "setup returns a cleanup function");
   assert.equal(typeof harness.toolHooks["execute.before"], "function", "execute.before hook registered");
   assert.equal(typeof harness.toolHooks["execute.after"], "function", "execute.after hook registered");
-  assert.equal(typeof harness.sessionHooks.prompt, "function", "prompt hook registered when observePrompts is on");
+  assert.equal(typeof harness.sessionHooks.prompt, "function", "observe.js's prompt hook registered when observePrompts is on");
+  assert.equal(typeof harness.sessionHooks.context, "function", "inject.js's context hook registered when inject.enabled is on");
 
   const commandNames = harness.commandDefs.map((def) => def.name).sort();
   assert.deepEqual(
@@ -230,12 +268,12 @@ function createPluginHarness(directory, options) {
   const clippedLine = lines.find((line) => line.tool === "write");
   assert.ok(clippedLine.input.length <= 5000, "oversized input clipped to 5000 chars");
 
-  // observePrompts: false must skip registering observe.js's own prompt
-  // hook, but lib/inject.js registers its own "prompt" hook independently
+  // observePrompts: false must skip registering observe.js's own "prompt"
+  // hook; inject.js registers its own "context" hook independently
   // (inject.enabled defaults to true, unrelated to observePrompts): with
-  // both off, no prompt hook at all is registered; with only
-  // observePrompts off, exactly one (injection's) is, and it never
-  // appends an observation.
+  // both off, no session hook at all is registered; with only
+  // observePrompts off, exactly one ("context") is, and firing it never
+  // appends an observation (that is observe.js's job, and it never ran).
   const { projectDir: noPromptDir, dataDir: noPromptData } = makeProjectAndData("no-prompt");
   const noPromptHarness = createPluginHarness(noPromptDir, {
     python: "python3",
@@ -248,7 +286,12 @@ function createPluginHarness(directory, options) {
   assert.equal(
     noPromptHarness.sessionHooks.prompt,
     undefined,
-    "no prompt hook at all when both observePrompts and inject.enabled are false",
+    "no 'prompt' hook at all when observePrompts is false",
+  );
+  assert.equal(
+    noPromptHarness.sessionHooks.context,
+    undefined,
+    "no 'context' hook at all when inject.enabled is false",
   );
   await noPromptCleanup();
 
@@ -260,15 +303,16 @@ function createPluginHarness(directory, options) {
     board: { enabled: false },
   });
   const injectOnlyCleanup = await setup(injectOnlyHarness.ctx);
+  assert.equal(injectOnlyHarness.sessionHooks.prompt, undefined, "with observePrompts off, no 'prompt' hook is registered at all");
   assert.equal(
-    injectOnlyHarness.sessionHookLists.prompt?.length,
+    injectOnlyHarness.sessionHookLists.context?.length,
     1,
-    "with observePrompts off, only injection's prompt hook is registered",
+    "with observePrompts off, injection's 'context' hook is still registered",
   );
   const injectOnlyProject = await resolveProject(injectOnlyHarness.ctx, { python: "python3", dataDir: injectOnlyData });
-  await injectOnlyHarness.sessionHooks.prompt({ sessionID: "s2", metadata: {}, prompt: { text: "anything at all" } });
+  await injectOnlyHarness.sessionHooks.context(contextEvent({ sessionID: "s2", userText: "anything at all" }));
   const injectOnlyLines = await readJsonLines(injectOnlyProject.observations_file).catch(() => []);
-  assert.equal(injectOnlyLines.length, 0, "with observePrompts off, a prompt still never becomes a user_prompt observation");
+  assert.equal(injectOnlyLines.length, 0, "with observePrompts off, firing the context hook never becomes a user_prompt observation");
   await injectOnlyCleanup();
 
   // /instinct-status runs the CLI directly and posts a synthetic reply;
@@ -350,7 +394,7 @@ function createPluginHarness(directory, options) {
   const project = await resolveProject(ctx, options);
 
   // A pre-existing inherited instinct with the same id as one of the
-  // fake model's "valid" blocks exercises the inherited-dedup rule (F6c).
+  // fake model's "valid" blocks exercises the inherited-dedup rule.
   await writeInstinct(
     project.instincts_inherited,
     { id: "grep-before-edit", trigger: "when editing unfamiliar files", confidence: 0.6, domain: "workflow", scope: "project" },
@@ -366,9 +410,9 @@ function createPluginHarness(directory, options) {
   await appendObservation(project, { event: "tool_start", tool: "edit", session: "obs-session", agent: "build", project_id: project.id, project_name: project.name, input: "edit 2" });
   // Hooks fire concurrently; three overlapping triggers must produce one
   // run. A fresh observer instance for this check: `observer`'s own
-  // per-instance, 30s line-count throttle (F1, lib/observer.js) would
-  // otherwise still be holding the stale 2-line count it read a moment ago
-  // in the assertion above, masking the observation just appended.
+  // per-instance, 30s line-count throttle would otherwise still be
+  // holding the stale 2-line count it read a moment ago in the assertion
+  // above, masking the observation just appended.
   const thresholdObserver = createObserver(ctx, options);
   await Promise.all([
     thresholdObserver.maybeRun("obs-session"),
@@ -384,6 +428,8 @@ function createPluginHarness(directory, options) {
   assert.ok(writtenContent.includes("scope: project"), "scope forced to project");
   assert.ok(writtenContent.includes(`project_id: ${project.id}`), "project_id stamped on the written instinct");
   assert.ok(writtenContent.includes(`project_name: ${project.name}`), "project_name stamped on the written instinct");
+  assert.ok(writtenContent.includes('summary: "Use functional components with hooks."'), "the model's summary field is kept");
+  assert.ok(/created: \d{4}-\d{2}-\d{2}T/.test(writtenContent), "a created: timestamp is stamped at write time");
 
   const logContent = await fs.readFile(path.join(project.project_dir, "observer.log"), "utf8");
   assert.ok(/run: 1 written, 3 rejected, model fakeprov\/fakemodel/.test(logContent), `observer.log recorded the run: ${logContent}`);
@@ -403,7 +449,7 @@ function createPluginHarness(directory, options) {
 
   // The run above just wrote lastRunAt into .observer-state.json; a fresh
   // observer instance for the same project must now reject on the interval
-  // gate alone (F1) without ever reading, let alone re-counting, the
+  // gate alone without ever reading, let alone re-counting, the
   // observations file.
   const gatedObserver = createObserver(ctx, options);
   assert.equal(gatedObserver._countLineReads(), 0, "fresh observer instance starts with zero observation-file reads");
@@ -436,8 +482,136 @@ function createPluginHarness(directory, options) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. lib/observer.js's parseInstinctBlock: the `summary:` field is
+//     required (missing / over 160 chars rejected, over 120 trimmed at
+//     parse time), and a trigger carrying a leaked trailing `confidence:`
+//     (or domain:/scope:/source:) fragment is rejected outright.
+// ---------------------------------------------------------------------------
+{
+  const goodBlock = [
+    "---",
+    "id: good-instinct",
+    'trigger: "run tests before pushing"',
+    "confidence: 0.7",
+    "domain: workflow",
+    'summary: "Run the test suite before every push."',
+    "---",
+    "# Good",
+    "",
+    "## Action",
+    "Run tests first.",
+  ].join("\n");
+  const parsedGood = parseInstinctBlock(goodBlock);
+  assert.equal(parsedGood.error, undefined, "a fully valid block (with summary) parses without error");
+  assert.equal(parsedGood.fields.summary, "Run the test suite before every push.");
+
+  const leakedTrigger = [
+    "---",
+    "id: leaky",
+    'trigger: "run tests before pushing, confidence: 0.9"',
+    "confidence: 0.7",
+    "domain: workflow",
+    'summary: "Run tests."',
+    "---",
+    "# Leaky",
+    "",
+    "## Action",
+    "Run tests first.",
+  ].join("\n");
+  const parsedLeaked = parseInstinctBlock(leakedTrigger);
+  assert.ok(
+    parsedLeaked.error?.includes("leaked frontmatter field"),
+    `a trigger carrying a trailing 'confidence:' fragment is rejected: ${parsedLeaked.error}`,
+  );
+
+  const missingSummary = ["---", "id: no-summary", 'trigger: "run tests before pushing"', "confidence: 0.7", "domain: workflow", "---", "# No Summary", "", "## Action", "Run tests first."].join(
+    "\n",
+  );
+  const parsedMissing = parseInstinctBlock(missingSummary);
+  assert.ok(parsedMissing.error?.includes("missing summary"), `a block with no summary field is rejected: ${parsedMissing.error}`);
+
+  const longSummary = [
+    "---",
+    "id: long-summary",
+    'trigger: "run tests before pushing"',
+    "confidence: 0.7",
+    "domain: workflow",
+    `summary: "${"x".repeat(161)}"`,
+    "---",
+    "# Long",
+    "",
+    "## Action",
+    "Run tests first.",
+  ].join("\n");
+  const parsedLong = parseInstinctBlock(longSummary);
+  assert.ok(parsedLong.error?.includes("too long"), `a summary over 160 chars is rejected: ${parsedLong.error}`);
+
+  const clippableSummary = [
+    "---",
+    "id: clip-summary",
+    'trigger: "run tests before pushing"',
+    "confidence: 0.7",
+    "domain: workflow",
+    `summary: "${"y".repeat(130)}"`,
+    "---",
+    "# Clip",
+    "",
+    "## Action",
+    "Run tests first.",
+  ].join("\n");
+  const parsedClip = parseInstinctBlock(clippableSummary);
+  assert.equal(parsedClip.error, undefined, "a summary between 120 and 160 chars is trimmed, not rejected");
+  assert.equal(parsedClip.fields.summary.length, 120, "a long-but-under-160 summary is trimmed to 120 at write time");
+}
+
+// ---------------------------------------------------------------------------
+// 2c. lib/observer.js's missing-summary backfill: an existing personal
+//     instinct with no `summary:` field gets listed in the next observer
+//     run's prompt (a "## Missing Summaries" section), even with zero new
+//     observations, instructing the model to add only a summary.
+// ---------------------------------------------------------------------------
+{
+  const { projectDir, dataDir } = makeProjectAndData("missing-summary");
+  const options = {
+    python: "python3",
+    dataDir,
+    observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 5, minObservations: 20, maxAnalysisLines: 300, notify: false },
+    maintenance: { ...MAINTENANCE_DEFAULTS },
+  };
+  const fixedCreated = new Date(Date.now() - 45 * 86400000).toISOString();
+  let capturedPrompt = "";
+  const backfillResponse = `<instinct>\n---\nid: legacy-habit\ntrigger: "legacy trigger text"\nconfidence: 0.6\ndomain: misc\nsummary: "Do the legacy thing."\n---\n# Legacy\n\n## Action\nDo the legacy thing.\n</instinct>`;
+  const ctx = {
+    location: { directory: projectDir },
+    generate: {
+      text: async (args) => {
+        capturedPrompt = args.prompt;
+        return { text: backfillResponse };
+      },
+    },
+    session: { synthetic: async () => ({}) },
+  };
+  const project = await resolveProject(ctx, options);
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "legacy-habit", trigger: "legacy trigger text", confidence: 0.6, domain: "misc", created: fixedCreated },
+    "# Legacy\n\n## Action\nDo the legacy thing.\n",
+  );
+
+  const observer = createObserver(ctx, options);
+  const summary = await observer.run("sess-missing", { notify: false });
+  assert.ok(capturedPrompt.includes("## Missing Summaries"), "an existing instinct with no summary triggers the backfill prompt section");
+  assert.ok(capturedPrompt.includes("legacy-habit"), "the missing-summary section names the instinct");
+  assert.ok(!summary.includes("run skipped"), "a run with zero new observations but a missing summary still executes");
+
+  const backfilledContent = await fs.readFile(path.join(project.instincts_personal, "legacy-habit.md"), "utf8");
+  assert.ok(backfilledContent.includes('summary: "Do the legacy thing."'), "the resubmitted block's summary is written");
+  assert.ok(backfilledContent.includes(`created: ${fixedCreated}`), "a summary-only backfill preserves the instinct's original created: date instead of resetting its age");
+}
+
+// ---------------------------------------------------------------------------
 // 4. project.js: concurrent first resolveProject calls for a directory with
-//    no cache entry yet share one in-flight resolution (F6), i.e. spawn one
+//    no cache entry yet share one in-flight resolution, i.e. spawn one
 //    python subprocess rather than one per caller. Counted by pointing
 //    options.python at a wrapper script (under the scratch root) that
 //    tallies its own invocations before exec'ing the real interpreter.
@@ -490,9 +664,11 @@ function createPluginHarness(directory, options) {
 //    today/3 days ago/30 days ago, plus 1 parked), and an eval fixture
 //    (x-workspace/iteration-2/benchmark.json with a failing expectation,
 //    mirroring the schema skill-creator writes), produces the expected
-//    richer facts, writes board-state.json atomically under the ~50 KB
-//    budget, and writes a pointer file that resolves back to it the same
-//    way the TUI side's own hashing would.
+//    richer facts (including the 0.7.0 additions: readyToShare,
+//    firedToday, awaitingFirstUse, skillCandidates, maintenance), writes
+//    board-state.json atomically under the ~50 KB budget, and writes a
+//    pointer file that resolves back to it the same way the TUI side's
+//    own hashing would.
 // ---------------------------------------------------------------------------
 {
   const { refreshBoardState } = await import("./lib/board.js");
@@ -594,14 +770,7 @@ function createPluginHarness(directory, options) {
 
   // Eval fixture: mirrors the schema skill-creator writes at
   // <workspace>/iteration-N/benchmark.json, verified against a live run's
-  // output (metadata.skill_name/timestamp; runs[].expectations[]; the
-  // "with"-prefixed config and the other one's pass_rate.mean/stddev;
-  // run_summary.delta.pass_rate). The baseline config here is
-  // "without_skill" (the common naming), so state.evals.baselineKind
-  // should read "without"; the "old_skill" naming (baselineKind "old") is
-  // covered directly against lib/board-text.js in section 8 below, since
-  // board-evals.js's branch on the two names is a one-line condition not
-  // worth a second full fixture directory for.
+  // output.
   const evalTimestamp = new Date(now - 2 * 86400000).toISOString();
   const iterationDir = path.join(evalRoot, "x-workspace", "iteration-2");
   await fs.mkdir(iterationDir, { recursive: true });
@@ -636,15 +805,7 @@ function createPluginHarness(directory, options) {
     new Date(new Date(lastRunAt).getTime() + 10 * 60000).toISOString(),
     "next run eligible 10 minutes after lastRunAt",
   );
-  assert.equal(state.instincts.readyToPromote, 2, "0.9 and 0.85 both clear the 0.8 PROMOTE_CONFIDENCE threshold");
-  assert.deepEqual(
-    state.instincts.domains,
-    [
-      { name: "workflow", count: 2 },
-      { name: "tooling", count: 1 },
-    ],
-    "domains tallied across all 3 instincts and sorted desc",
-  );
+  assert.equal(state.instincts.readyToShare, 2, "0.9 and 0.85 both clear the 0.8 promote threshold and neither is in the (empty) global bucket");
   assert.equal(state.instincts.newestId, "gamma-instinct", "gamma-instinct has the latest mtime (touched to 'now')");
   assert.ok(typeof state.instincts.newestAt === "string" && !Number.isNaN(Date.parse(state.instincts.newestAt)));
   assert.equal(state.instincts.runs, 3, "3 observer.log run lines");
@@ -657,53 +818,36 @@ function createPluginHarness(directory, options) {
       { id: "beta-instinct", confidence: 0.85, domain: "workflow", trigger: "b" },
       { id: "gamma-instinct", confidence: 0.6, domain: "tooling", trigger: "c" },
     ],
-    "instincts.list sorted by confidence desc, for the detail panel",
+    "instincts.list sorted by confidence desc",
   );
-  assert.deepEqual(state.instincts.list.map((inst) => inst.fired), [0, 0, 0], "fired defaults to 0 when the frontmatter field is absent");
   assert.equal(state.instincts.lastWriteAt, "2026-10-02T00:00:00.000Z", "lastWriteAt is the timestamp of the most recent run line with written > 0");
   assert.equal(state.instincts.lastObservedAt, null, "no .activity.json written in this fixture, so lastObservedAt stays null");
   assert.equal(state.instincts.appliedToday, 0, "no .activity.json written in this fixture, so appliedToday stays 0");
+  assert.equal(state.instincts.firedToday, 0, "no .activity.json written in this fixture, so firedToday stays 0");
+  assert.equal(state.instincts.awaitingFirstUse, 0, "no instincts/pending directory exists yet");
+  assert.equal(state.instincts.skillCandidates, 0, "no evolved/ candidate files exist yet");
+  assert.equal(state.instincts.candidatesPath, project.evolved_dir, "the hint path is the project's own evolved dir");
+  assert.deepEqual(
+    state.instincts.maintenance,
+    { lastRunAt: null, lastEvolveAt: null, counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0 } },
+    "no maintenance.log yet, so the maintenance summary is all-empty",
+  );
 
   assert.equal(state.observations.available, true);
   assert.equal(state.observations.open, 3, "two explicit opens plus the file with no status line");
   assert.equal(state.observations.parked, 1);
   assert.equal(state.observations.lastReview, "2026-10-01");
   assert.equal(state.observations.staged, 2, "1 of 3 headings says installed");
-  assert.deepEqual(
-    state.observations.topSkills,
-    [
-      { skill: "workflow", count: 3 },
-      { skill: "tooling", count: 1 },
-    ],
-    "topSkills tallied over the 3 OPEN files only, sorted desc",
-  );
-  assert.deepEqual(state.observations.skills, state.observations.topSkills, "only 2 distinct skills exist, so skills (all) equals topSkills");
   assert.equal(state.observations.addedToday, 1, "only the today-dated open file counts");
   assert.equal(state.observations.added7d, 2, "today + 3-days-ago open files fall within the 7-day window");
-  assert.equal(state.observations.newestTitle, "Open A", "Open A carries the max (today's) date");
-  assert.ok(typeof state.observations.newestAt === "string" && !Number.isNaN(Date.parse(state.observations.newestAt)));
-  assert.deepEqual(
-    state.observations.newest.map((entry) => entry.title),
-    ["Open A", "Open B", "Open D"],
-    "newest sorted desc by date, parked file excluded",
-  );
   assert.equal(state.observations.warning, false, "only 3 open observations, well under the 100-open warning threshold");
 
   assert.equal(state.evals.available, true);
   assert.equal(state.evals.skill, "pr");
-  assert.equal(state.evals.iteration, 2);
   assert.equal(state.evals.withSkill, 0.92);
   assert.equal(state.evals.baseline, 0.08);
   assert.equal(state.evals.baselineKind, "without", "without_skill baseline config reads as the 'without' naming convention");
-  assert.equal(state.evals.delta, 0.84);
   assert.equal(state.evals.timestamp, evalTimestamp);
-  assert.equal(state.evals.runs, 4, "runs.length is used directly when the runs array is present");
-  assert.deepEqual(
-    state.evals.firstFailure,
-    { text: "Handles edge case", evidence: "missing branch" },
-    "the first run with a failing expectation, in file order",
-  );
-  assert.deepEqual(state.evals.stddev, { with: 0.03, baseline: 0.02 });
 
   // The state file and pointer file are both written, atomically, and the
   // pointer resolves back to the exact state file path.
@@ -778,8 +922,9 @@ function createPluginHarness(directory, options) {
 // ---------------------------------------------------------------------------
 // 7. /board summary text (lib/board-format.js) must never throw, including
 //    when the board has not been written yet or every block reports itself
-//    unavailable, and must use the same titles/wording as the sidebar
-//    panel (lib/board-text.js), just as plain text.
+//    unavailable, and must use the same block labels/wording as the
+//    sidebar panel (lib/board-text.js), just as plain text with dot-filled
+//    alignment and a trailing legend row.
 // ---------------------------------------------------------------------------
 {
   const { formatBoardSummary } = await import("./lib/board-format.js");
@@ -789,6 +934,7 @@ function createPluginHarness(directory, options) {
     missing = formatBoardSummary(null, {});
   }, "missing board state never throws");
   assert.equal(typeof missing, "string");
+  assert.ok(missing.includes("Board state not written yet"));
 
   const everythingUnavailable = {
     updatedAt: new Date().toISOString(),
@@ -801,11 +947,11 @@ function createPluginHarness(directory, options) {
     summary = formatBoardSummary(everythingUnavailable, {});
   }, "an all-unavailable board state never throws");
   assert.equal(typeof summary, "string");
-  assert.ok(summary.includes("not found"), "unavailable observations/evals blocks render as 'not found'");
-  assert.ok(summary.includes("not available"), "a missing instincts section (no available flag of its own) renders as 'not available'");
-  assert.ok(summary.includes("Instincts \u00b7 observer"), "instincts title falls back to the bare 'observer' tool name with no model configured");
-  assert.ok(summary.includes("Skill observations \u00b7 task-observer"), "/board uses the same renamed title as the sidebar panel");
-  assert.ok(summary.includes("Skill evals \u00b7 skill-creator"), "/board uses the same renamed title as the sidebar panel");
+  assert.ok(summary.includes("Learned habits"), "the instincts block renders under its plain-language label");
+  assert.ok(summary.includes("Skill notes"), "the observations block renders under its plain-language label");
+  assert.ok(summary.includes("Skill test"), "the evals block (no skill name on record) renders as the bare 'Skill test' label");
+  assert.ok(summary.includes("none"), "an unavailable block's headline reads 'none'");
+  assert.ok(summary.includes("active") && summary.includes("needs attention") && summary.includes("stale"), "the legend row is always appended");
   assert.ok(!/[\u2014\u2013]/.test(summary), "/board text never contains an em or en dash");
 
   const disabledSections = formatBoardSummary(everythingUnavailable, { board: { sections: { instincts: false, observations: false, evals: false } } });
@@ -813,159 +959,129 @@ function createPluginHarness(directory, options) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. lib/board-text.js: the wording shared by the sidebar panel and
-//    /board, exercised directly (pure functions, no ctx needed) across
-//    every branch the redesign introduced. `assertShort` enforces the
-//    <= 36 character budget on the lines where the fixture data below was
-//    chosen to fit it; the instincts run-stats line and the "N inherited"
-//    summary are excluded on purpose - both are fixed English wording
-//    ("<n> runs, <n> written, <n> rejected \u00b7 next <rel>", "<n>
-//    learned, <n> ready to promote, <n> inherited") that cannot drop
-//    below ~37-42 characters even with every count at a single digit, so
-//    their exact text is still asserted, just not against the bound.
+// 8. lib/board-text.js: the structured block model and alignRow helper
+//    shared by the sidebar panel and /board, exercised directly (pure
+//    functions, no ctx needed). Covers all three glyph states for the
+//    instincts block, hint-row presence/omission, the observations and
+//    evals blocks' own glyph rules, and alignRow's right-alignment math.
 // ---------------------------------------------------------------------------
 {
-  const { instinctsToolName, instinctsLines, observationsLines, evalsLines } = await import("./lib/board-text.js");
+  const { alignRow, buildEvalsBlock, buildInstinctsBlock, buildObservationsBlock, GLYPH_CHAR, LEGEND, PANEL_WIDTH } = await import("./lib/board-text.js");
 
-  const assertShort = (lines) => {
-    for (const line of lines) assert.ok(line.length <= 36, `line exceeds 36 chars: ${JSON.stringify(line)} (${line.length})`);
-  };
+  // --- alignRow -------------------------------------------------------
+  assert.equal(alignRow("open", "398", { fill: "." }), `open ${".".repeat(PANEL_WIDTH - "open".length - "398".length - 2)} 398`);
+  assert.equal(alignRow("a", "b").length, PANEL_WIDTH, "space-fill pads the full row out to PANEL_WIDTH");
+  assert.ok(alignRow("a".repeat(50), "b").endsWith(" b"), "a label longer than the width still keeps at least one gap before the value");
+  assert.equal(alignRow("label", "value", { width: 10, fill: "." }), "label . value", "a too-narrow width still keeps the minimum single fill character");
 
-  assert.equal(instinctsToolName(null), "observer", "no instincts section at all falls back to 'observer'");
-  assert.equal(instinctsToolName({ model: null }), "observer", "no model configured falls back to 'observer'");
-  assert.equal(instinctsToolName({ model: "anthropic/claude-haiku-4-5" }), "haiku observer", "a haiku model reads as 'haiku observer'");
-  assert.equal(instinctsToolName({ model: "ANTHROPIC/CLAUDE-HAIKU" }), "haiku observer", "the haiku match is case-insensitive");
-  assert.equal(instinctsToolName({ model: "anthropic/claude-opus-4-1" }), "claude-opus-4-1", "a non-haiku model reads as its last path segment");
-  assert.equal(instinctsToolName({ model: "fakemodel" }), "fakemodel", "a model id with no '/' is used as-is");
-
-  assert.deepEqual(instinctsLines(null), ["not available"], "no instincts section renders a single fallback line");
-
-  const neverRun = instinctsLines({
-    project: 9,
-    global: 0,
-    inherited: 0,
-    readyToPromote: 4,
-    domains: [
-      { name: "workflow", count: 6 },
-      { name: "tooling", count: 2 },
-    ],
-    observerEnabled: true,
-    lastRun: null,
-    nextRunEligibleAt: null,
-  });
-  assert.deepEqual(
-    neverRun,
-    ["9 learned, 4 ready to promote", "workflow 6 \u00b7 tooling 2", "never run yet"],
-    "never run yet takes priority over the run-stats wording",
-  );
-  assertShort(neverRun);
-
-  const withInherited = instinctsLines({
-    project: 5,
-    global: 0,
-    inherited: 2,
-    readyToPromote: 1,
-    domains: [{ name: "workflow", count: 7 }],
+  // --- buildInstinctsBlock: three glyph states -------------------------
+  const activeModel = buildInstinctsBlock({
+    project: 10,
+    inherited: 4,
+    global: 2,
     observerEnabled: true,
     lastRun: new Date().toISOString(),
     nextRunEligibleAt: new Date(Date.now() + 3 * 60000).toISOString(),
-    runs: 3,
-    written: 4,
-    rejected: 1,
+    readyToShare: 0,
   });
-  assert.deepEqual(
-    withInherited,
-    ["7 learned, 1 ready to promote, 2 inherited", "workflow 7", "3 runs, 4 written, 1 rejected \u00b7 next 3m"],
-    "inherited > 0 is appended, and the run-stats line always carries '\u00b7 next <rel>' once there is a lastRun",
-  );
-  assertShort([withInherited[1]]);
+  assert.equal(activeModel.glyph, "active", "observer enabled and run recently reads active");
+  assert.equal(activeModel.headline, "16", "headline is project+inherited+global");
+  assert.ok(activeModel.rows.some((row) => row.label === "ready to share globally" && row.value === "0"), "a zero (known) readyToShare still renders its own row");
+  assert.ok(!activeModel.rows.some((row) => row.hint), "no hint row when readyToShare is 0");
+  assert.ok(activeModel.rows.some((row) => row.label === "next learning run"), "next learning run shown when enabled and scheduled");
 
-  const manyDomains = instinctsLines({
-    project: 10,
-    global: 0,
+  const attentionModelDisabled = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: false, lastRun: new Date().toISOString() });
+  assert.equal(attentionModelDisabled.glyph, "attention", "observer disabled reads attention even with a recent lastRun");
+
+  const attentionModelStaleRun = buildInstinctsBlock({
+    project: 1,
     inherited: 0,
-    readyToPromote: 0,
-    domains: [
-      { name: "a", count: 4 },
-      { name: "b", count: 3 },
-      { name: "c", count: 2 },
-      { name: "d", count: 1 },
-    ],
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date(Date.now() - 25 * 3600000).toISOString(),
+  });
+  assert.equal(attentionModelStaleRun.glyph, "attention", "a last run older than 24h reads attention");
+
+  const staleModel = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: null });
+  assert.equal(staleModel.glyph, "stale", "never run yet reads stale (no data to judge freshness)");
+
+  const unavailableInstincts = buildInstinctsBlock(null);
+  assert.equal(unavailableInstincts.glyph, "stale");
+  assert.equal(unavailableInstincts.headline, "none");
+  assert.deepEqual(unavailableInstincts.rows, []);
+
+  // --- hint rows: "ready to share globally" and "skill candidates" ----
+  const withShareHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 4 });
+  const shareRowIndex = withShareHint.rows.findIndex((row) => row.label === "ready to share globally");
+  assert.equal(withShareHint.rows[shareRowIndex].value, "4");
+  assert.equal(withShareHint.rows[shareRowIndex + 1]?.hint, "run /promote to share them", "the hint row immediately follows the row it annotates");
+
+  const withCandidates = buildInstinctsBlock({
+    project: 5,
+    inherited: 0,
+    global: 0,
     observerEnabled: true,
     lastRun: new Date().toISOString(),
-    nextRunEligibleAt: null,
+    readyToShare: 0,
+    skillCandidates: 2,
+    candidatesPath: "/tmp/evolved",
   });
-  assert.equal(manyDomains[1], "a 4 \u00b7 b 3 \u00b7 c 2 \u00b7 +1 more", "more than 3 domains collapse to '+N more'");
-  assert.equal(manyDomains[2], "0 runs, 0 written", "no nextRunEligibleAt omits the '\u00b7 next' suffix entirely");
-  assertShort([manyDomains[1], manyDomains[2]]);
+  const candidatesRowIndex = withCandidates.rows.findIndex((row) => row.label === "skill candidates");
+  assert.equal(withCandidates.rows[candidatesRowIndex].value, "2");
+  assert.equal(withCandidates.rows[candidatesRowIndex + 1]?.hint, "see /tmp/evolved");
 
-  assert.deepEqual(
-    instinctsLines({ project: 5, global: 0, inherited: 0, readyToPromote: 0, domains: [], observerEnabled: false, lastRun: new Date().toISOString() }),
-    ["5 learned, 0 ready to promote", "no domains yet", "observer off"],
-    "observerEnabled: false always reads 'observer off', even with a lastRun on record",
-  );
+  const withoutCandidates = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 0, skillCandidates: 0 });
+  assert.ok(!withoutCandidates.rows.some((row) => row.label === "skill candidates"), "skillCandidates: 0 omits the row entirely");
 
-  assert.deepEqual(observationsLines(null), ["not found"]);
-  assert.deepEqual(observationsLines({ available: false }), ["not found"]);
+  // --- activity rows omitted at zero, shown when positive --------------
+  const noActivity = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), appliedToday: 0, firedToday: 0 });
+  assert.ok(!noActivity.rows.some((row) => row.label === "added to prompts today"));
+  assert.ok(!noActivity.rows.some((row) => row.label === "used by the agent today"));
+  const withActivity = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), appliedToday: 5, firedToday: 2 });
+  assert.ok(withActivity.rows.some((row) => row.label === "added to prompts today" && row.value === "5"));
+  assert.ok(withActivity.rows.some((row) => row.label === "used by the agent today" && row.value === "2"));
 
-  const observations398 = observationsLines({
-    available: true,
-    open: 398,
-    lastReview: null,
-    topSkills: [
-      { skill: "review", count: 12 },
-      { skill: "testing", count: 4 },
-    ],
-    addedToday: 3,
-    added7d: 9,
-    newestAt: new Date(Date.now() - 2 * 3600000).toISOString(),
-  });
-  assert.deepEqual(
-    observations398,
-    ["398 open, review never", "review 12 \u00b7 testing 4", "+3 today, +9 this week \u00b7 newest 2h"],
-    "no last-review date reads 'review never'",
-  );
-  assertShort(observations398);
+  // --- "kept tidy" summary row: omitted when all-zero, joined otherwise
+  const keptTidyEmpty = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0 } } });
+  assert.ok(!keptTidyEmpty.rows.some((row) => row.label === "kept tidy"), "an all-zero week omits the 'kept tidy' row");
+  const keptTidySome = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 1, archived: 2, merged: 0, pruned: 0, candidates: 0, repaired: 0 } } });
+  const keptTidyRow = keptTidySome.rows.find((row) => row.label === "kept tidy");
+  assert.equal(keptTidyRow.value, "promoted 1, archived 2", "zero items are omitted, nonzero ones joined in a fixed order");
 
-  const longSkillName = observationsLines({
-    available: true,
-    open: 1,
-    lastReview: new Date(Date.now() - 3 * 86400000).toISOString(),
-    topSkills: [{ skill: "a-very-long-skill-name-indeed", count: 1 }],
-    addedToday: 0,
-    added7d: 0,
-    newestAt: null,
-  });
-  assert.equal(longSkillName[0], "1 open, review 3d ago");
-  assert.equal(longSkillName[1], "a-very-long-skill-nam\u2026 1", "a skill name over 22 chars is truncated with an ellipsis");
-  assert.equal(longSkillName[2], "+0 today, +0 this week \u00b7 newest never", "no newestAt reads 'newest never'");
-  assertShort([longSkillName[0], longSkillName[1]]);
+  // --- buildObservationsBlock ------------------------------------------
+  assert.deepEqual(buildObservationsBlock(null), { key: "observations", label: "Skill notes", available: false, glyph: "stale", headline: "none", rows: [] });
+  const notesActive = buildObservationsBlock({ available: true, open: 42, added7d: 9, lastReview: new Date().toISOString(), warning: false });
+  assert.equal(notesActive.glyph, "active");
+  assert.equal(notesActive.headline, "42");
+  assert.deepEqual(notesActive.rows.map((row) => row.label), ["open", "added this week", "last reviewed"]);
+  const notesAttention = buildObservationsBlock({ available: true, open: 398, added7d: 158, lastReview: null, warning: true });
+  assert.equal(notesAttention.glyph, "attention");
+  assert.equal(notesAttention.rows.find((row) => row.label === "last reviewed").value, "never");
 
-  assert.deepEqual(evalsLines(null), ["not found"]);
-  assert.deepEqual(evalsLines({ available: false }), ["not found"]);
+  // --- buildEvalsBlock ---------------------------------------------------
+  const evalsNone = buildEvalsBlock(null);
+  assert.equal(evalsNone.label, "Skill test", "no eval data at all reads as the bare label");
+  assert.equal(evalsNone.glyph, "stale");
+  assert.equal(evalsNone.headline, "none");
 
-  const prEval = evalsLines({
-    available: true,
-    skill: "pr",
-    iteration: 2,
-    withSkill: 0.92,
-    baseline: 0.08,
-    baselineKind: "without",
-    timestamp: new Date(Date.now() - 2 * 86400000).toISOString(),
-    runs: 4,
-  });
-  assert.deepEqual(
-    prEval,
-    ["pr, iteration 2 \u00b7 2d old, n=4", "92% with skill, 8% without"],
-    "the default/'without_skill' naming reads 'with skill'/'without', with age and run count appended",
-  );
-  assertShort(prEval);
+  const evalsNoSkillName = buildEvalsBlock({ available: true, skill: null, withSkill: 0.9, baseline: 0.1, timestamp: new Date().toISOString() });
+  assert.equal(evalsNoSkillName.label, "Skill test", "available data with no skill name on record still reads as the bare label");
+  assert.equal(evalsNoSkillName.glyph, "stale");
 
-  assert.deepEqual(
-    evalsLines({ available: true, skill: "pr", iteration: 2, withSkill: 0.92, baseline: 0.08, baselineKind: "old" }),
-    ["pr, iteration 2", "92% new, 8% old"],
-    "the 'old_skill' naming reads 'new'/'old' instead, and with no timestamp/runs the '\u00b7 ...' suffix is omitted entirely",
-  );
+  const evalsFresh = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date(Date.now() - 2 * 86400000).toISOString() });
+  assert.equal(evalsFresh.label, "Skill test (pr)");
+  assert.equal(evalsFresh.glyph, "active", "a benchmark under 7 days old reads active");
+  assert.deepEqual(evalsFresh.rows, [{ label: "with skill", value: "92%" }, { label: "without", value: "8%" }]);
+
+  const evalsStale = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date(Date.now() - 9 * 86400000).toISOString() });
+  assert.equal(evalsStale.glyph, "stale", "a benchmark over 7 days old reads stale");
+
+  const evalsOldNaming = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "old", timestamp: new Date().toISOString() });
+  assert.deepEqual(evalsOldNaming.rows, [{ label: "new", value: "92%" }, { label: "old", value: "8%" }], "the 'old_skill' naming reads 'new'/'old' instead of 'with skill'/'without'");
+
+  // --- shared glyph/legend constants ------------------------------------
+  assert.deepEqual(GLYPH_CHAR, { active: "\u25cf", attention: "\u25cf", stale: "\u25cb" });
+  assert.deepEqual(LEGEND.map((entry) => entry.glyph), ["active", "attention", "stale"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,12 +1125,13 @@ function createPluginHarness(directory, options) {
 // ---------------------------------------------------------------------------
 // 10. lib/activity.js: recordObserved always flushes on its first call for
 //     a project, then throttles to at most once per 10s; recordApplied's
-//     writes are never throttled and never clobber lastObservedAt;
-//     readActivitySnapshot always reads straight from disk and is
-//     date-scoped (a stale appliedDate reads as 0 "today").
+//     and recordFired's writes are never throttled and never clobber
+//     lastObservedAt or each other; readActivitySnapshot always reads
+//     straight from disk and is date-scoped (a stale appliedDate/firedDate
+//     reads as 0 "today").
 // ---------------------------------------------------------------------------
 {
-  const { recordObserved, recordApplied, readActivitySnapshot } = await import("./lib/activity.js");
+  const { recordObserved, recordApplied, recordFired, readActivitySnapshot } = await import("./lib/activity.js");
 
   const { projectDir } = makeProjectAndData("activity");
   await fs.mkdir(projectDir, { recursive: true });
@@ -1022,6 +1139,7 @@ function createPluginHarness(directory, options) {
   const before = await readActivitySnapshot(projectDir);
   assert.equal(before.lastObservedAt, null, "no .activity.json yet: lastObservedAt starts null");
   assert.equal(before.appliedToday, 0, "no .activity.json yet: appliedToday starts 0");
+  assert.equal(before.firedToday, 0, "no .activity.json yet: firedToday starts 0");
 
   await recordObserved(projectDir);
   const firstWrite = JSON.parse(await fs.readFile(path.join(projectDir, ".activity.json"), "utf8"));
@@ -1033,40 +1151,40 @@ function createPluginHarness(directory, options) {
 
   await recordApplied(projectDir, 2);
   await recordApplied(projectDir, 3);
+  await recordFired(projectDir);
+  await recordFired(projectDir, 2);
   const afterApplied = await readActivitySnapshot(projectDir);
   assert.equal(afterApplied.appliedToday, 5, "recordApplied accumulates within the same day");
-  // recordObserved updates its in-memory lastObservedAt on every call,
-  // even a throttled one that skips its own disk flush; recordApplied's
-  // own write flushes the shared in-memory state as a whole, so the
-  // on-disk lastObservedAt after it legitimately reflects that latest
-  // in-memory value, not necessarily the exact string from firstWrite.
-  // What it must never do is drop or null out the field.
+  assert.equal(afterApplied.firedToday, 3, "recordFired accumulates within the same day, independently of appliedToday");
   assert.ok(
     typeof afterApplied.lastObservedAt === "string" && !Number.isNaN(Date.parse(afterApplied.lastObservedAt)),
-    "recordApplied's writes never clobber lastObservedAt with null/undefined",
+    "recordApplied/recordFired's writes never clobber lastObservedAt with null/undefined",
   );
   assert.ok(Date.parse(afterApplied.lastObservedAt) >= Date.parse(firstWrite.lastObservedAt), "lastObservedAt never moves backwards");
 
-  // A stale appliedDate (e.g. from before midnight UTC) must read as 0 for
-  // "today" rather than passed through as-is.
+  // A stale appliedDate/firedDate (e.g. from before midnight UTC) must
+  // read as 0 for "today" rather than passed through as-is.
   const activityPath = path.join(projectDir, ".activity.json");
   const stale = JSON.parse(await fs.readFile(activityPath, "utf8"));
   stale.appliedDate = "2000-01-01";
   stale.appliedToday = 99;
+  stale.firedDate = "2000-01-01";
+  stale.firedToday = 99;
   await fs.writeFile(activityPath, JSON.stringify(stale), "utf8");
   const afterStaleDate = await readActivitySnapshot(projectDir);
   assert.equal(afterStaleDate.appliedToday, 0, "appliedToday from a different (stale) date reads as 0 for today");
+  assert.equal(afterStaleDate.firedToday, 0, "firedToday from a different (stale) date reads as 0 for today");
 }
 
 // ---------------------------------------------------------------------------
 // 11. lib/inject.js pure functions: candidate selection (confidence
 //     filter, inject.exclude, malformed-trigger skip, sort, max cap), the
 //     1200-char injected-block budget (dropping the lowest-confidence
-//     entry first), and the significant-word overlap the fired-count
-//     bump is keyed on.
+//     entry first), and the word-overlap helpers lib/maintain.js's steps
+//     and the fired-count bump are keyed on.
 // ---------------------------------------------------------------------------
 {
-  const { selectForInjection, formatInjectionBlock, significantWords, sharedSignificantWordCount, DEFAULT_INJECT_OPTIONS } = await import(
+  const { selectForInjection, formatInjectionBlock, significantWords, sharedSignificantWordCount, significantWordOverlapRatio, DEFAULT_INJECT_OPTIONS } = await import(
     "./lib/inject.js"
   );
 
@@ -1106,26 +1224,27 @@ function createPluginHarness(directory, options) {
   assert.equal(malformedCalls, 2, "onMalformed is called once per skipped malformed candidate");
 
   const smallEntries = [
-    { id: "a", trigger: "alpha trigger", line: "do the alpha thing" },
-    { id: "b", trigger: "beta trigger", line: "do the beta thing" },
+    { id: "a", trigger: "alpha trigger", summary: "do the alpha thing" },
+    { id: "b", trigger: "beta trigger", summary: "do the beta thing" },
   ];
   const smallBlock = formatInjectionBlock(smallEntries);
-  assert.ok(smallBlock.text.startsWith("<instincts>\n") && smallBlock.text.endsWith("\n</instincts>"), "block is wrapped in <instincts>/</instincts>");
-  assert.ok(smallBlock.text.includes("- alpha trigger: do the alpha thing"), "each line is '- <trigger>: <line>'");
+  assert.ok(smallBlock.text.startsWith("<instincts> learned habits for this project\n"), "block opens with the plain-language description line");
+  assert.ok(smallBlock.text.endsWith("\n</instincts>"), "block still closes with </instincts>");
+  assert.ok(smallBlock.text.includes("- do the alpha thing"), "each line is '- <summary>' only (no trigger prefix)");
   assert.deepEqual(smallBlock.ids, ["a", "b"]);
   assert.ok(smallBlock.text.length <= 1200);
 
-  const longLine = "x".repeat(500);
+  const longSummary = "x".repeat(500);
   const oversizedEntries = [
-    { id: "big1", trigger: "t1", line: longLine },
-    { id: "big2", trigger: "t2", line: longLine },
-    { id: "big3", trigger: "t3", line: longLine },
+    { id: "big1", trigger: "t1", summary: longSummary },
+    { id: "big2", trigger: "t2", summary: longSummary },
+    { id: "big3", trigger: "t3", summary: longSummary },
   ];
   const trimmedBlock = formatInjectionBlock(oversizedEntries);
   assert.ok(trimmedBlock.text.length <= 1200, "the block is trimmed to stay under the 1200-char budget");
   assert.ok(!trimmedBlock.ids.includes("big3"), "the lowest-confidence (last, assuming callers pass entries sorted desc) entry is dropped first");
 
-  const singleOversized = formatInjectionBlock([{ id: "huge", trigger: "t", line: "y".repeat(2000) }]);
+  const singleOversized = formatInjectionBlock([{ id: "huge", trigger: "t", summary: "y".repeat(2000) }]);
   assert.equal(singleOversized, null, "formatInjectionBlock returns null when even a single entry cannot fit the budget");
 
   assert.deepEqual(
@@ -1143,13 +1262,61 @@ function createPluginHarness(directory, options) {
     0,
     "no shared significant words",
   );
+
+  assert.equal(
+    significantWordOverlapRatio("grep before editing unfamiliar repository files", "grep before editing unfamiliar repository code"),
+    1,
+    "every significant word of the shorter side (3) is present in the longer side",
+  );
+  assert.equal(significantWordOverlapRatio("totally unrelated text", "please grep this unfamiliar repository"), 0, "no overlap at all");
+  assert.equal(significantWordOverlapRatio("", "anything"), 0, "an empty side has no significant words to overlap on");
 }
 
 // ---------------------------------------------------------------------------
-// 12. lib/observe.js's stripInjectedBlock: removes exactly the injected
-//     <instincts>...</instincts> block (and the blank line(s) injection
-//     adds before it), so the observer only ever logs/distils what the
-//     user actually typed.
+// 11b. lib/store.js's summary helpers (the "summary fallback" lib/inject.js
+//      uses for an instinct written before 0.7.0, with no `summary:` field
+//      of its own): the first sentence of its `## Action` section, clipped
+//      to 120 chars, falling back further to the old title/first-line
+//      behaviour when there is no Action section at all.
+// ---------------------------------------------------------------------------
+{
+  const { clipSummary, firstActionSentence, readInstinctSummaryLine } = await import("./lib/store.js");
+
+  assert.equal(clipSummary("short"), "short");
+  assert.equal(clipSummary("x".repeat(130)), "x".repeat(120), "clipSummary trims to 120 chars by default");
+
+  const withAction = "# Title\n\n## Action\nSearch the repository with grep before editing unfamiliar files. Then proceed.\n";
+  assert.equal(
+    firstActionSentence(withAction),
+    "Search the repository with grep before editing unfamiliar files.",
+    "only the first sentence of the Action section is kept",
+  );
+
+  const longAction = `# Title\n\n## Action\n${"x".repeat(200)} is one very long sentence without punctuation\n`;
+  assert.equal(firstActionSentence(longAction).length, 120, "a sentence with no terminator is clipped to 120 chars");
+
+  const noAction = "# Just A Title\n\nNo Action section here.\n";
+  assert.equal(firstActionSentence(noAction), "Just A Title", "falls back to the title when there is no Action section");
+
+  const { projectDir } = makeProjectAndData("summary-fallback");
+  const dir = path.join(projectDir, "instincts", "personal");
+  await writeInstinct(dir, { id: "no-summary-habit", trigger: "t", confidence: 0.8, domain: "misc" }, withAction);
+  const fallbackLine = await readInstinctSummaryLine(dir, "no-summary-habit", undefined);
+  assert.equal(fallbackLine, "Search the repository with grep before editing unfamiliar files.", "readInstinctSummaryLine falls back to firstActionSentence when no summary: field is given");
+
+  const withSummaryField = await readInstinctSummaryLine(dir, "no-summary-habit", "Already have a summary.");
+  assert.equal(withSummaryField, "Already have a summary.", "an explicit summary (e.g. the frontmatter field) short-circuits the fallback entirely");
+}
+
+// ---------------------------------------------------------------------------
+// 12. lib/observe.js's stripInjectedBlock: removes an injected
+//     `<instincts>...</instincts>` block (and the blank line(s) before
+//     it), so a residual block from before 0.7.0 (when injection still
+//     edited prompt text) is still stripped the same way. 0.7.0 itself
+//     never writes into prompt text at all (lib/inject.js now uses the
+//     "context" hook's `system` array), which is why this is "harmless"
+//     now rather than load-bearing: kept for defence, exercised directly
+//     since nothing in the live pipeline still produces this shape.
 // ---------------------------------------------------------------------------
 {
   const { stripInjectedBlock } = await import("./lib/observe.js");
@@ -1165,12 +1332,14 @@ function createPluginHarness(directory, options) {
 }
 
 // ---------------------------------------------------------------------------
-// 13. lib/inject.js live wiring: registerInject's session.hook("prompt")
-//     actually appends the <instincts> block for qualifying instincts
-//     only, sets event.metadata.mightyInstincts, counts the injection in
-//     .activity.json, bumps `fired` on the matching instinct's own
-//     frontmatter, and skips entirely for a loop re-prompt, a ulw
-//     re-prompt, or a prompt already carrying mightyInstincts metadata.
+// 13. lib/inject.js live wiring via the "context" hook: registerInject's
+//     session.hook("context", ...) pushes exactly one SystemPart onto
+//     `event.system` for qualifying instincts (never editing `messages`),
+//     counts the injection in .activity.json, bumps `fired` on the
+//     matching instinct's own frontmatter (and records it in
+//     .activity.json's firedToday), considers a pending instinct for
+//     firing without ever injecting it, and skips entirely when the
+//     latest user Message carries loop/ulw metadata.
 // ---------------------------------------------------------------------------
 {
   const { registerInject } = await import("./lib/inject.js");
@@ -1199,44 +1368,244 @@ function createPluginHarness(directory, options) {
     { id: "low-confidence", trigger: "something else entirely", confidence: 0.4, domain: "misc" },
     "# Low Confidence\n\n## Action\nShould never be injected.\n",
   );
+  const pendingDir = siblingInstinctsDir(project, "pending");
+  await writeInstinct(
+    pendingDir,
+    { id: "pending-habit", trigger: "grep unfamiliar repository before editing pending", confidence: 0.5, domain: "workflow" },
+    "# Pending\n\n## Action\nNot yet proven.\n",
+  );
 
   await registerInject(ctx, options);
-  assert.equal(typeof hooks.prompt, "function", "registerInject registered a session.hook('prompt') callback");
+  assert.equal(typeof hooks.context, "function", "registerInject registered a session.hook('context') callback");
 
-  const event = { sessionID: "inject-s1", metadata: {}, prompt: { text: "please grep this unfamiliar repository before editing anything" } };
-  await hooks.prompt(event);
+  const event = contextEvent({ sessionID: "inject-s1", userText: "please grep this unfamiliar repository before editing anything" });
+  const originalMessages = event.messages;
+  await hooks.context(event);
 
-  assert.ok(event.prompt.text.includes("<instincts>"), "prompt text gained the injected block");
-  assert.ok(event.prompt.text.includes("grep unfamiliar repository before editing"), "injected block carries the qualifying instinct's trigger");
-  assert.ok(!event.prompt.text.includes("something else entirely"), "the below-threshold instinct was never selected for injection");
-  assert.deepEqual(event.metadata.mightyInstincts, { injected: ["grep-before-edit"] }, "metadata records exactly the injected id");
+  assert.equal(event.system.length, 1, "exactly one SystemPart was pushed");
+  assert.equal(event.system[0].type, "text");
+  assert.ok(event.system[0].text.startsWith("<instincts> learned habits for this project"), "the injected block opens with the plain-language description line");
+  assert.ok(
+    event.system[0].text.includes("Search the repository with grep before editing unfamiliar files."),
+    "injected block carries the qualifying instinct's summary (fallback: first Action sentence)",
+  );
+  assert.ok(!event.system[0].text.includes("Should never be injected"), "the below-threshold instinct was never selected for injection");
+  assert.strictEqual(event.messages, originalMessages, "the messages array itself is never mutated");
 
   const activity = JSON.parse(await fs.readFile(path.join(project.project_dir, ".activity.json"), "utf8"));
   assert.equal(activity.appliedToday, 1, "one injection counted for today in .activity.json");
+  assert.equal(activity.firedToday, 2, "two fired-count bumps counted for today: the injected instinct and the pending one both matched this message");
 
   const writtenContent = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
-  assert.ok(/fired:\s*1/.test(writtenContent), "fired bumped to 1: the prompt shares 3+ significant words with the trigger");
+  assert.ok(/fired:\s*1/.test(writtenContent), "fired bumped to 1: the latest user message shares 3+ significant words with the trigger");
 
-  const loopEvent = { sessionID: "inject-s1", metadata: { opencode_loop_v2: true }, prompt: { text: "grep the repository before editing" } };
-  await hooks.prompt(loopEvent);
-  assert.ok(!loopEvent.prompt.text.includes("<instincts>"), "a loop re-prompt (opencode_loop_v2 metadata) is never injected into");
+  const pendingContent = await fs.readFile(path.join(pendingDir, "pending-habit.md"), "utf8");
+  assert.ok(/fired:\s*1/.test(pendingContent), "the pending instinct's fired count is bumped too, even though it was never injected");
 
-  const ulwEvent = { sessionID: "inject-s1", metadata: { ulw: "active" }, prompt: { text: "grep the repository before editing" } };
-  await hooks.prompt(ulwEvent);
-  assert.ok(!ulwEvent.prompt.text.includes("<instincts>"), "a ulw re-prompt (ulw metadata) is never injected into");
+  const loopEvent = contextEvent({ sessionID: "inject-s1", userText: "grep the repository before editing" });
+  loopEvent.messages[loopEvent.messages.length - 1].metadata = { opencode_loop_v2: true };
+  await hooks.context(loopEvent);
+  assert.deepEqual(loopEvent.system, [], "a loop re-prompt (opencode_loop_v2 metadata on the latest user message) is never injected into");
 
-  const alreadyInjected = { sessionID: "inject-s1", metadata: { mightyInstincts: { injected: ["x"] } }, prompt: { text: "grep the repository before editing" } };
-  await hooks.prompt(alreadyInjected);
-  assert.ok(!alreadyInjected.prompt.text.includes("<instincts>"), "a prompt already carrying mightyInstincts metadata is never re-injected");
+  const ulwEvent = contextEvent({ sessionID: "inject-s1", userText: "grep the repository before editing" });
+  ulwEvent.messages[ulwEvent.messages.length - 1].metadata = { ulw: "active" };
+  await hooks.context(ulwEvent);
+  assert.deepEqual(ulwEvent.system, [], "a ulw re-prompt (ulw metadata on the latest user message) is never injected into");
 
-  // fired must not bump again on a prompt that shares no significant
+  // fired must not bump again on a message that shares no significant
   // words with the trigger, even though the instinct still qualifies and
   // gets injected.
-  const unrelatedEvent = { sessionID: "inject-s1", metadata: {}, prompt: { text: "please summarise the quarterly numbers" } };
-  await hooks.prompt(unrelatedEvent);
-  assert.ok(unrelatedEvent.prompt.text.includes("<instincts>"), "the instinct is still injected even when unrelated to the prompt");
+  const unrelatedEvent = contextEvent({ sessionID: "inject-s1", userText: "please summarise the quarterly numbers" });
+  await hooks.context(unrelatedEvent);
+  assert.equal(unrelatedEvent.system.length, 1, "the instinct is still injected even when unrelated to the prompt");
   const contentAfterUnrelated = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
-  assert.ok(/fired:\s*1/.test(contentAfterUnrelated), "fired stays at 1: an unrelated prompt never bumps it");
+  assert.ok(/fired:\s*1/.test(contentAfterUnrelated), "fired stays at 1: an unrelated message never bumps it");
+}
+
+// ---------------------------------------------------------------------------
+// 14. lib/maintain.js: every maintenance step against a temp data dir.
+//     promote across two fake projects (exact-id match), prune an old
+//     pending file (plus a soon-to-expire warning and an unaffected
+//     fresh one), decay to archive (and a lighter decay that only lowers
+//     confidence), dedupe merging a near-duplicate, evolve clustering
+//     three related instincts into one candidate file, classifyNewInstinct's
+//     "50% rule", graduatePendingStep promoting a fired pending instinct,
+//     and repairStep cleaning a leaked trigger (idempotently).
+// ---------------------------------------------------------------------------
+{
+  const maintRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "maintenance-"));
+
+  // --- promote: two fake project stores, same id, both confident -------
+  const homunculus = path.join(maintRoot, "homunculus");
+  const projectsRoot = path.join(homunculus, "projects");
+  const personalA = path.join(projectsRoot, "proj-a", "instincts", "personal");
+  const personalB = path.join(projectsRoot, "proj-b", "instincts", "personal");
+  await fs.mkdir(personalA, { recursive: true });
+  await fs.mkdir(personalB, { recursive: true });
+  const sharedFields = { id: "shared-pattern", trigger: "always run the full test suite before pushing commits", domain: "workflow", summary: "Run the test suite before pushing.", created: new Date().toISOString() };
+  await writeInstinct(personalA, { ...sharedFields, confidence: 0.9 }, "# Shared\n\n## Action\nRun tests before every push.\n");
+  await writeInstinct(personalB, { ...sharedFields, confidence: 0.85 }, "# Shared\n\n## Action\nRun tests before every push.\n");
+
+  const promoteOptions = { dataDir: homunculus };
+  const promoteLog = [];
+  const promoted = await promoteStep(promoteOptions, { log: (line) => promoteLog.push(line) });
+  assert.equal(promoted, 1, "one instinct promoted: same id, confidence >= 0.8, found in 2 distinct project stores");
+  const globalPersonalDir = path.join(homunculus, "instincts", "personal");
+  assert.deepEqual(await fs.readdir(globalPersonalDir), ["shared-pattern.md"]);
+  const globalContent = await fs.readFile(path.join(globalPersonalDir, "shared-pattern.md"), "utf8");
+  assert.ok(globalContent.includes("scope: global"), "the promoted copy carries scope: global");
+  assert.ok(!globalContent.includes("project_id"), "project-specific fields are dropped from the promoted copy");
+  assert.ok(promoteLog.some((line) => line.includes("promote: copied shared-pattern to global store (found in 2 projects)")));
+
+  const secondPromote = await promoteStep(promoteOptions, { log: () => {} });
+  assert.equal(secondPromote, 0, "an instinct already in the global store is never promoted twice");
+
+  // --- prune: an old pending file, one within the warning window, one fresh
+  const pruneProject = {
+    project_dir: path.join(maintRoot, "proj-prune"),
+    instincts_personal: path.join(maintRoot, "proj-prune", "instincts", "personal"),
+    evolved_dir: path.join(maintRoot, "proj-prune", "evolved"),
+  };
+  const prunePendingDir = siblingInstinctsDir(pruneProject, "pending");
+  await fs.mkdir(prunePendingDir, { recursive: true });
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+  await writeInstinct(prunePendingDir, { id: "old-pending", trigger: "t1", confidence: 0.5, domain: "misc", summary: "s1", created: daysAgo(40) }, "# Old\n");
+  await writeInstinct(prunePendingDir, { id: "warn-pending", trigger: "t2", confidence: 0.5, domain: "misc", summary: "s2", created: daysAgo(25) }, "# Warn\n");
+  await writeInstinct(prunePendingDir, { id: "fresh-pending", trigger: "t3", confidence: 0.5, domain: "misc", summary: "s3", created: daysAgo(2) }, "# Fresh\n");
+
+  const pruneLog = [];
+  const pruned = await pruneStep(pruneProject, { log: (line) => pruneLog.push(line) });
+  assert.equal(pruned, 1, "only the 40-day-old pending file (TTL 30 days) is pruned");
+  assert.deepEqual((await fs.readdir(prunePendingDir)).sort(), ["fresh-pending.md", "warn-pending.md"]);
+  assert.ok(pruneLog.some((line) => line.includes("prune: deleted old-pending")));
+  assert.ok(pruneLog.some((line) => line.includes("prune: warning warn-pending expires in")), "a file within 7 days of expiry logs a warning instead of deleting");
+
+  // --- decay: one drops below 0.4 (archived), one stays above (lowered),
+  //     one never fired=0 but already has fired>0 (left untouched)
+  const decayProject = {
+    project_dir: path.join(maintRoot, "proj-decay"),
+    instincts_personal: path.join(maintRoot, "proj-decay", "instincts", "personal"),
+    evolved_dir: path.join(maintRoot, "proj-decay", "evolved"),
+  };
+  await fs.mkdir(decayProject.instincts_personal, { recursive: true });
+  const archiveWorthy = daysAgo(30 + 3 * 7); // 3 full weeks past the 30-day grace period
+  const lightlyOld = daysAgo(30 + 1 * 7);
+  await writeInstinct(decayProject.instincts_personal, { id: "stale-habit", trigger: "t", confidence: 0.5, domain: "misc", summary: "s", created: archiveWorthy }, "# Stale\n");
+  await writeInstinct(decayProject.instincts_personal, { id: "lightly-old", trigger: "t", confidence: 0.6, domain: "misc", summary: "s", created: lightlyOld }, "# Lightly\n");
+  await writeInstinct(decayProject.instincts_personal, { id: "proven-habit", trigger: "t", confidence: 0.5, domain: "misc", summary: "s", created: archiveWorthy, fired: 3 }, "# Proven\n");
+
+  const decayLog = [];
+  const { archived, decayed } = await decayStep(decayProject, { log: (line) => decayLog.push(line) });
+  assert.equal(archived, 1, "stale-habit drops from 0.5 to 0.35 (3 weeks * 0.05) and crosses the 0.4 archive threshold");
+  assert.equal(decayed, 1, "lightly-old drops from 0.6 to 0.55 and stays in personal");
+  const decayArchiveDir = siblingInstinctsDir(decayProject, "archive");
+  assert.deepEqual(await fs.readdir(decayArchiveDir), ["stale-habit.md"]);
+  assert.ok(!(await fs.readdir(decayProject.instincts_personal)).includes("stale-habit.md"), "archived, never deleted outright: moved out of personal");
+  const lightlyOldContent = await fs.readFile(path.join(decayProject.instincts_personal, "lightly-old.md"), "utf8");
+  assert.ok(/confidence:\s*0\.55/.test(lightlyOldContent));
+  const provenContent = await fs.readFile(path.join(decayProject.instincts_personal, "proven-habit.md"), "utf8");
+  assert.ok(/confidence:\s*0\.5(\s|$)/.test(provenContent), "a fired instinct is never decayed, regardless of age");
+  assert.ok(decayLog.some((line) => line.includes("decay: archived stale-habit")));
+  assert.ok(decayLog.some((line) => line.includes("decay: lowered lightly-old confidence to 0.55")));
+
+  // --- dedupe: a near-duplicate merges into the existing file -----------
+  const dedupeProject = path.join(maintRoot, "proj-dedupe", "instincts", "personal");
+  await fs.mkdir(dedupeProject, { recursive: true });
+  await writeInstinct(
+    dedupeProject,
+    { id: "existing-habit", trigger: "grep before editing unfamiliar repository files", confidence: 0.6, domain: "workflow", summary: "Grep before editing unfamiliar files.", created: new Date().toISOString() },
+    "# Existing\n\n## Action\nGrep first.\n\n## Evidence\n- Observed 3 times\n",
+  );
+  const dedupeLog = [];
+  const merged = await dedupeOrMerge(
+    dedupeProject,
+    { id: "new-habit", trigger: "grep before editing unfamiliar repository code", confidence: 0.7, summary: "Grep." },
+    "# New\n\n## Action\nGrep.\n\n## Evidence\n- Observed 2 more times\n",
+    { log: (line) => dedupeLog.push(line) },
+  );
+  assert.equal(merged, true, "overlapping trigger+summary merges into the existing instinct instead of writing a new file");
+  assert.deepEqual(await fs.readdir(dedupeProject), ["existing-habit.md"], "no new-habit.md was ever written");
+  const mergedContent = await fs.readFile(path.join(dedupeProject, "existing-habit.md"), "utf8");
+  assert.ok(/confidence:\s*0\.65/.test(mergedContent), "confidence raised by 0.05");
+  assert.ok(mergedContent.includes('summary: "Grep."'), "a shorter new summary replaces the existing (longer) one");
+  assert.ok(mergedContent.includes("Observed 3 times") && mergedContent.includes("Observed 2 more times"), "the new evidence paragraph is appended to the existing ## Evidence section");
+  assert.ok(dedupeLog.some((line) => line.includes("dedupe: merged new-habit into existing-habit")));
+
+  // --- evolve: three overlapping testing-domain instincts cluster -------
+  const evolveProject = {
+    project_dir: path.join(maintRoot, "proj-evolve"),
+    instincts_personal: path.join(maintRoot, "proj-evolve", "instincts", "personal"),
+    evolved_dir: path.join(maintRoot, "proj-evolve", "evolved"),
+  };
+  await fs.mkdir(evolveProject.instincts_personal, { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    await writeInstinct(
+      evolveProject.instincts_personal,
+      {
+        id: `testing-habit-${i}`,
+        trigger: `always run the full test suite before merging pull request number ${i}`,
+        confidence: 0.6,
+        domain: "testing",
+        summary: `Run the full test suite before merging pull request ${i}.`,
+        created: new Date().toISOString(),
+      },
+      `# Testing ${i}\n\n## Action\nRun tests.\n`,
+    );
+  }
+  const evolveLog = [];
+  const { candidates } = await evolveStep(evolveProject, { log: (line) => evolveLog.push(line) });
+  assert.equal(candidates, 1, "three overlapping testing-domain instincts cluster into exactly one candidate file");
+  const evolvedFiles = await fs.readdir(evolveProject.evolved_dir);
+  assert.equal(evolvedFiles.length, 1);
+  const evolvedContent = await fs.readFile(path.join(evolveProject.evolved_dir, evolvedFiles[0]), "utf8");
+  assert.ok(evolvedContent.includes("testing-habit-0") && evolvedContent.includes("testing-habit-1") && evolvedContent.includes("testing-habit-2"));
+  assert.ok(evolvedContent.includes("Suggested SKILL.md description"));
+  assert.ok(evolveLog.some((line) => line.includes("evolve: wrote cluster")));
+
+  // --- classifyNewInstinct: the "50% rule" ------------------------------
+  assert.equal(classifyNewInstinct({ confidence: 0.5 }, "# Body\n\n## Action\nDo it.\n"), "pending", "exactly 0.5 confidence with no Evidence section goes to pending");
+  assert.equal(classifyNewInstinct({ confidence: 0.5 }, "# Body\n\n## Action\nDo it.\n\n## Evidence\n- seen\n"), "personal", "an Evidence section exempts it from the pending rule even at 0.5");
+  assert.equal(classifyNewInstinct({ confidence: 0.51 }, "# Body\n"), "personal", "anything other than exactly 0.5 confidence is never routed to pending");
+
+  // --- graduatePendingStep: fired promotes a pending instinct to personal
+  const graduateProject = {
+    project_dir: path.join(maintRoot, "proj-graduate"),
+    instincts_personal: path.join(maintRoot, "proj-graduate", "instincts", "personal"),
+    evolved_dir: path.join(maintRoot, "proj-graduate", "evolved"),
+  };
+  await fs.mkdir(graduateProject.instincts_personal, { recursive: true });
+  const graduatePendingDir = siblingInstinctsDir(graduateProject, "pending");
+  await writeInstinct(graduatePendingDir, { id: "unused-pending", trigger: "t", confidence: 0.5, domain: "misc", summary: "s", created: new Date().toISOString() }, "# Unused\n");
+  await writeInstinct(graduatePendingDir, { id: "used-pending", trigger: "t", confidence: 0.5, domain: "misc", summary: "s", created: new Date().toISOString(), fired: 2 }, "# Used\n");
+  const graduateLog = [];
+  const graduated = await graduatePendingStep(graduateProject, { log: (line) => graduateLog.push(line) });
+  assert.equal(graduated, 1, "only the pending instinct that has fired at least once graduates");
+  assert.deepEqual((await fs.readdir(graduatePendingDir)).sort(), ["unused-pending.md"]);
+  assert.deepEqual(await fs.readdir(graduateProject.instincts_personal), ["used-pending.md"]);
+  assert.ok(graduateLog.some((line) => line.includes("pending: promoted used-pending to personal (fired 2)")));
+
+  // --- repairStep: a leaked trailing frontmatter fragment in the trigger
+  const repairProject = {
+    project_dir: path.join(maintRoot, "proj-repair"),
+    instincts_personal: path.join(maintRoot, "proj-repair", "instincts", "personal"),
+    evolved_dir: path.join(maintRoot, "proj-repair", "evolved"),
+  };
+  await fs.mkdir(repairProject.instincts_personal, { recursive: true });
+  await writeInstinct(
+    repairProject.instincts_personal,
+    { id: "leaky-trigger", trigger: "grep before editing unfamiliar files, confidence: 0.8", confidence: 0.8, domain: "workflow", summary: "Grep first.", created: new Date().toISOString() },
+    "# Leaky\n",
+  );
+  const repairLog = [];
+  const repaired = await repairStep(repairProject, { log: (line) => repairLog.push(line) });
+  assert.equal(repaired, 1);
+  const repairedContent = await fs.readFile(path.join(repairProject.instincts_personal, "leaky-trigger.md"), "utf8");
+  assert.ok(repairedContent.includes('trigger: "grep before editing unfamiliar files"'), "the trigger is cleaned back to just the real trigger text");
+  assert.ok(!repairedContent.includes("files, confidence"), "the leaked trailing fragment is gone");
+  assert.ok(repairLog.some((line) => line.includes("repair: cleaned trigger of leaky-trigger")));
+
+  const secondRepair = await repairStep(repairProject, { log: () => {} });
+  assert.equal(secondRepair, 0, "repairStep is idempotent: a clean trigger never matches the leaked-suffix pattern again");
 }
 
 function buildFakeObserverOutput() {
@@ -1245,6 +1614,7 @@ id: prefer-functional-components
 trigger: "when creating react components"
 confidence: 0.7
 domain: code-style
+summary: "Use functional components with hooks."
 ---
 # Prefer Functional Components
 
@@ -1255,12 +1625,14 @@ Use functional components with hooks instead of classes.
 - Observed 5 times across this session`;
 
   // Shares an id with the inherited instinct seeded above, so it must be
-  // rejected as a duplicate rather than written.
+  // rejected as a duplicate rather than written. Needs a valid summary of
+  // its own so it reaches that check instead of failing parsing first.
   const duplicateOfInherited = `---
 id: grep-before-edit
 trigger: "when editing unfamiliar files"
 confidence: 0.6
 domain: workflow
+summary: "Search before editing unfamiliar files."
 ---
 # Grep Before Edit
 

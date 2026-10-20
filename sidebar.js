@@ -1,10 +1,12 @@
 /**
  * OpenCode 2 sidebar panel for mighty-instincts.
  *
- * One collapsible box with a block per board source (Instincts, Skill
- * observations, Skill evals), read from the board-state.json the server
+ * One collapsible box with a block per board source (Learned habits,
+ * Skill notes, Skill test), read from the board-state.json the server
  * half (lib/board.js) writes, found through the pointer file
- * lib/board-pointer.js describes.
+ * lib/board-pointer.js describes, and rendered from the structured block
+ * model lib/board-text.js builds (also shared, unchanged in wording, by
+ * the /board command's plain-text summary in lib/board-format.js).
  *
  * Laid out like the oh-my-opencode-slim agent panel (single border,
  * header row, two-space indented fact lines) so the two read as
@@ -17,8 +19,14 @@
  * which this panel does not add. The default/merge logic behind the
  * collapsed state lives in lib/board-interaction.js (solid-js-free, so
  * smoke-test.mjs can assert on it); this file only wires that into solid
- * signals and persistence. Fact lines themselves are plain text (no
- * click, no detail view beyond what the three/four lines already say).
+ * signals and persistence.
+ *
+ * Right alignment for a block's title row (label left, a status circle
+ * plus headline right) and its detail rows (label left, value right) is
+ * native flexbox here (flexGrow on the label pushes the value to the
+ * row's own right edge), not lib/board-text.js's own `alignRow` string
+ * helper: that one is for lib/board-format.js's plain-text output, which
+ * has no layout engine to delegate to.
  *
  * Collapsed state is persisted through ctx.storage, keyed by
  * BOARD_STORAGE_KEY. The only ctx.storage surface confirmed on this
@@ -35,7 +43,7 @@ import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 import fs from "node:fs";
 import { pointerFilePath } from "./lib/board-pointer.js";
-import { evalsLines, EVALS_TOOL, instinctsLines, instinctsToolName, observationsLines, OBSERVATIONS_TOOL } from "./lib/board-text.js";
+import { buildEvalsBlock, buildInstinctsBlock, buildObservationsBlock, GLYPH_CHAR, LEGEND } from "./lib/board-text.js";
 import { BOARD_STORAGE_KEY, defaultInteractionState, mergeInteractionState } from "./lib/board-interaction.js";
 import { PKG_NAME, PKG_VERSION } from "./lib/pkg.js";
 
@@ -44,14 +52,14 @@ const BORDER = { type: "single" };
 const POLL_MS = 1000;
 const GLYPH_EXPANDED = "\u25be"; // ▾
 const GLYPH_COLLAPSED = "\u25b8"; // ▸
-const GLYPH_MISSING = "!";
-// Pulse glyph cycle for the Instincts title (task: "reuse the spinner
-// frames idea"): a slow breathe, not a spinner direction, since this
-// means "recently active", not "in progress".
+// Pulse glyph cycle for the Learned habits title (task: "reuse the
+// spinner frames idea"): a slow breathe, not a spinner direction, since
+// this means "recently active", not "in progress". Replaces the block's
+// usual status circle while an observation landed in the last
+// PULSE_WINDOW_MS, exactly as it did for the old "Instincts" title.
 const PULSE_FRAMES = ["\u00b7", "\u2022", "\u25cf", "\u2022"]; // · • ● •
 const PULSE_MS = 500;
 const PULSE_WINDOW_MS = 60000;
-const WRITE_SUCCESS_WINDOW_MS = 5000;
 
 const FALLBACK = {
   text: "#e5e7eb",
@@ -65,10 +73,9 @@ export function mountSidebar(ctx) {
   const [tick, setTick] = createSignal(0);
   const pollTimer = setInterval(() => setTick((n) => n + 1), POLL_MS);
   // Its own timer, independent of the 1s data poll above: the pulse glyph
-  // must keep cycling every 500ms, and the pulse/success-color windows
-  // below (PULSE_WINDOW_MS, WRITE_SUCCESS_WINDOW_MS) must expire on time,
-  // even for several ticks in a row where board-state.json itself has not
-  // changed.
+  // must keep cycling every 500ms, and PULSE_WINDOW_MS must expire on
+  // time, even for several ticks in a row where board-state.json itself
+  // has not changed.
   const [pulseFrameIndex, setPulseFrameIndex] = createSignal(0);
   const pulseTimer = setInterval(() => setPulseFrameIndex((n) => (n + 1) % PULSE_FRAMES.length), PULSE_MS);
   const interaction = createInteraction(ctx);
@@ -181,14 +188,6 @@ function safe(read) {
   }
 }
 
-// A missing section (state not written yet) and an explicit
-// `available: false` both render as a single "!" / "not found" fact row;
-// anything else (including the instincts block, which has no
-// `available` flag of its own) renders its normal fact lines.
-function isAvailable(section) {
-  return section ? section.available !== false : false;
-}
-
 // ---------------------------------------------------------------- view
 
 function renderPanel(data, colors, interaction, pulseFrameIndex) {
@@ -206,50 +205,15 @@ function renderPanel(data, colors, interaction, pulseFrameIndex) {
     const pulseGlyph = isWithinMs(state?.instincts?.lastObservedAt, PULSE_WINDOW_MS)
       ? PULSE_FRAMES[pulseFrameIndex % PULSE_FRAMES.length]
       : null;
-    const titleColor = isWithinMs(state?.instincts?.lastWriteAt, WRITE_SUCCESS_WINDOW_MS) ? colors.success : null;
-    rows.push(
-      ...block({
-        key: "instincts",
-        label: "Instincts",
-        tool: instinctsToolName(state?.instincts),
-        lines: instinctsLines(state?.instincts),
-        available: true,
-        warnFirstLine: false,
-        interaction,
-        colors,
-        pulseGlyph,
-        titleColor,
-      }),
-    );
+    rows.push(...block({ key: "instincts", model: buildInstinctsBlock(state?.instincts), interaction, colors, pulseGlyph }));
   }
   if (sections.observations !== false) {
-    rows.push(
-      ...block({
-        key: "observations",
-        label: "Skill observations",
-        tool: OBSERVATIONS_TOOL,
-        lines: observationsLines(state?.observations),
-        available: isAvailable(state?.observations),
-        warnFirstLine: state?.observations?.warning === true,
-        interaction,
-        colors,
-      }),
-    );
+    rows.push(...block({ key: "observations", model: buildObservationsBlock(state?.observations), interaction, colors }));
   }
   if (sections.evals !== false) {
-    rows.push(
-      ...block({
-        key: "evals",
-        label: "Skill evals",
-        tool: EVALS_TOOL,
-        lines: evalsLines(state?.evals),
-        available: isAvailable(state?.evals),
-        warnFirstLine: false,
-        interaction,
-        colors,
-      }),
-    );
+    rows.push(...block({ key: "evals", model: buildEvalsBlock(state?.evals), interaction, colors }));
   }
+  rows.push(legendRow(colors));
   return frame(colors, [header, ...rows]);
 }
 
@@ -264,24 +228,64 @@ function isWithinMs(iso, windowMs) {
   return age >= 0 && age < windowMs;
 }
 
-// One block: a clickable title row (section name, optionally in the
-// success color for WRITE_SUCCESS_WINDOW_MS after the observer last wrote
-// an instinct, plus a pulse glyph while an observation landed within the
-// last PULSE_WINDOW_MS, then " · " and the tool name in muted, prefixed
-// with the same ▾/▸ glyph the header uses), then, when expanded, either
-// its normal (plain, non-interactive) fact lines or (available === false)
-// a single "!" / "not found" row.
-function block({ key, label, tool, lines, available, warnFirstLine, interaction, colors, pulseGlyph = null, titleColor = null }) {
+// A status circle colour for a block's glyph state ("active" success,
+// "attention" warning, "stale" muted); shared by a block's own title row
+// and the panel-wide legend row at the bottom.
+function glyphColor(glyph, colors) {
+  if (glyph === "active") return colors.success;
+  if (glyph === "attention") return colors.warning;
+  return colors.muted;
+}
+
+// One block: a clickable title row (label, flex-grown to push a status
+// circle + headline to the row's right edge, prefixed with the same
+// ▾/▸ glyph the header uses), then, when expanded, its detail rows (plain
+// fact rows) and hint sub-rows (muted, no value column: the board's
+// nearest equivalent to a tooltip, since the TUI has no hover).
+function block({ key, model, interaction, colors, pulseGlyph = null }) {
   const expanded = interaction.isBlockOpen(key);
+  const glyphChar = pulseGlyph ?? GLYPH_CHAR[model.glyph] ?? GLYPH_CHAR.stale;
+  const glyphClr = pulseGlyph ? colors.success : glyphColor(model.glyph, colors);
   const title = clickableRow(() => interaction.toggleBlock(key), [
     glyphText(expanded, colors),
-    text({ fg: titleColor ?? colors.text, wrapMode: "none", truncate: true, flexShrink: 1 }, [label]),
-    pulseGlyph ? text({ fg: colors.success, wrapMode: "none", flexShrink: 0 }, [` ${pulseGlyph}`]) : null,
-    text({ fg: colors.muted, wrapMode: "none", truncate: true, flexShrink: 0 }, [` \u00b7 ${tool}`]),
+    text({ fg: colors.text, wrapMode: "none", truncate: true, flexGrow: 1, flexShrink: 1 }, [model.label]),
+    text({ fg: glyphClr, wrapMode: "none", flexShrink: 0 }, [` ${glyphChar} `]),
+    text({ fg: colors.text, wrapMode: "none", flexShrink: 0, truncate: true }, [model.headline]),
   ]);
   if (!expanded) return [title];
-  if (!available) return [title, missingRow(colors)];
-  return [title, ...lines.map((line, index) => factRow(line, colors, { warning: warnFirstLine && index === 0 }))];
+  return [title, ...model.rows.map((row) => ("hint" in row ? hintRow(row.hint, colors) : detailRow(row, colors)))];
+}
+
+// A plain, non-interactive detail row: label flex-grown on the left,
+// value anchored to the right edge, muted (facts are supporting detail,
+// never as prominent as the title row's own label/headline).
+function detailRow(row, colors) {
+  return box({ width: "100%", flexDirection: "row", paddingLeft: 2, shouldFill: true }, [
+    text({ fg: colors.muted, wrapMode: "none", truncate: true, flexGrow: 1, flexShrink: 1 }, [row.label]),
+    text({ fg: colors.muted, wrapMode: "none", flexShrink: 0 }, [` ${row.value}`]),
+  ]);
+}
+
+// A hint sub-row ("run /promote to share them", "see <path>"): indented
+// one level deeper than a detail row and with no value column of its own,
+// since it is explanatory text, not a fact.
+function hintRow(hint, colors) {
+  return box({ width: "100%", flexDirection: "row", paddingLeft: 4, shouldFill: true }, [
+    text({ fg: colors.muted, wrapMode: "none", truncate: true }, [hint]),
+  ]);
+}
+
+// The panel-wide legend ("● active  ● needs attention  ○ stale"), shown
+// once at the bottom of an expanded panel (not per block): muted, with
+// each glyph in its own status colour.
+function legendRow(colors) {
+  const children = [];
+  LEGEND.forEach((entry, index) => {
+    if (index > 0) children.push(text({ fg: colors.muted, wrapMode: "none" }, ["  "]));
+    children.push(text({ fg: glyphColor(entry.glyph, colors), wrapMode: "none" }, [GLYPH_CHAR[entry.glyph]]));
+    children.push(text({ fg: colors.muted, wrapMode: "none" }, [` ${entry.label}`]));
+  });
+  return box({ width: "100%", flexDirection: "row", paddingTop: 1, shouldFill: true }, children);
 }
 
 function glyphText(expanded, colors) {
@@ -294,33 +298,6 @@ function glyphText(expanded, colors) {
 function headerVersionText(colors) {
   if (!PKG_VERSION) return null;
   return text({ fg: colors.muted, wrapMode: "none" }, [` v${PKG_VERSION}`]);
-}
-
-// A plain, non-interactive fact row. `warning` swaps its usual paddingLeft
-// for a colored "!" glyph of the same width, used for the observations
-// block's first line when state.observations.warning is true.
-function factRow(line, colors, { warning = false } = {}) {
-  const children = [];
-  if (warning) {
-    children.push(text({ fg: colors.warning, width: 2, flexShrink: 0, wrapMode: "none" }, [`${GLYPH_MISSING} `]));
-  }
-  children.push(text({ fg: colors.muted, wrapMode: "none", truncate: true }, [line]));
-  return box(
-    {
-      width: "100%",
-      flexDirection: "row",
-      paddingLeft: warning ? 0 : 2,
-      shouldFill: true,
-    },
-    children,
-  );
-}
-
-function missingRow(colors) {
-  return box({ width: "100%", flexDirection: "row", shouldFill: true }, [
-    text({ fg: colors.warning, width: 2, flexShrink: 0, wrapMode: "none" }, [`${GLYPH_MISSING} `]),
-    text({ fg: colors.muted, wrapMode: "none", truncate: true }, ["not found"]),
-  ]);
 }
 
 // A row whose click (primary mouse button only, mirroring
