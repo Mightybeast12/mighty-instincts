@@ -14,6 +14,7 @@ import { createObserver } from "./lib/observer.js";
 import { resolveProject } from "./lib/project.js";
 import { appendObservation, writeInstinct } from "./lib/store.js";
 import { runCli } from "./lib/cli.js";
+import { PKG_NAME } from "./lib/pkg.js";
 
 // os.tmpdir() resolves under /private/var/folders in the sandboxes this
 // plugin is developed in; nesting under opencode/instincts-test keeps every
@@ -109,7 +110,11 @@ function createPluginHarness(directory, options) {
 // ---------------------------------------------------------------------------
 {
   const { projectDir, dataDir } = makeProjectAndData("hooks");
-  const options = { python: "python3", dataDir };
+  // Board refresh is unrelated to this section's assertions and would add
+  // a real python subprocess call plus filesystem reads of the host's own
+  // task-observer / skill-creator directories; disabled here and tested on
+  // its own, with controlled fixtures, in section 5 below.
+  const options = { python: "python3", dataDir, board: { enabled: false } };
   const harness = createPluginHarness(projectDir, options);
 
   const cleanup = await setup(harness.ctx);
@@ -121,8 +126,8 @@ function createPluginHarness(directory, options) {
   const commandNames = harness.commandDefs.map((def) => def.name).sort();
   assert.deepEqual(
     commandNames,
-    ["evolve", "instinct-export", "instinct-import", "instinct-observe", "instinct-projects", "instinct-prune", "instinct-status", "promote"].sort(),
-    "all eight slash commands registered",
+    ["board", "evolve", "instinct-export", "instinct-import", "instinct-observe", "instinct-projects", "instinct-prune", "instinct-status", "promote"].sort(),
+    "all nine slash commands registered",
   );
   assert.equal(harness.toolDefs.length, 1, "one tool registered");
   assert.equal(harness.toolDefs[0].id, "instincts", "tool id is instincts");
@@ -211,7 +216,7 @@ function createPluginHarness(directory, options) {
 
   // observePrompts: false must skip registering the prompt hook entirely.
   const { projectDir: noPromptDir, dataDir: noPromptData } = makeProjectAndData("no-prompt");
-  const noPromptHarness = createPluginHarness(noPromptDir, { python: "python3", dataDir: noPromptData, observePrompts: false });
+  const noPromptHarness = createPluginHarness(noPromptDir, { python: "python3", dataDir: noPromptData, observePrompts: false, board: { enabled: false } });
   const noPromptCleanup = await setup(noPromptHarness.ctx);
   assert.equal(noPromptHarness.sessionHooks.prompt, undefined, "prompt hook not registered when observePrompts is false");
   await noPromptCleanup();
@@ -224,7 +229,7 @@ function createPluginHarness(directory, options) {
   assert.ok(statusReply, "instinct-status posted a synthetic reply");
   assert.equal(statusReply.resume, false, "synthetic reply never resumes the agent");
   assert.equal(statusReply.delivery, "queue");
-  assert.equal(statusReply.description, "opencode-instincts");
+  assert.equal(statusReply.description, PKG_NAME);
   assert.ok(statusReply.text.includes("No instincts found"), "status reflects the empty instinct store");
   assert.equal(harness.promptCalls.length, 0, "ctx.session.prompt is never called");
 
@@ -402,6 +407,170 @@ function createPluginHarness(directory, options) {
   );
   const spawnCount = (await fs.readFile(spawnCountFile, "utf8")).split("\n").filter((line) => line.trim().length > 0).length;
   assert.equal(spawnCount, 1, "concurrent first resolveProject calls for one directory share a single python subprocess");
+}
+
+// ---------------------------------------------------------------------------
+// 5. tui.js: importing it outside the TUI never throws, and setup() with a
+//    stub ctx that has no ui.slot returns a disposer without ever importing
+//    sidebar.js (which needs the host's @opentui/solid / solid-js and would
+//    throw in this plain-node test run if it were loaded).
+// ---------------------------------------------------------------------------
+{
+  const tuiPlugin = (await import("./tui.js")).default;
+  assert.equal(tuiPlugin.id, PKG_NAME, "tui companion shares the plugin id");
+  assert.equal(typeof tuiPlugin.setup, "function", "tui companion exports setup");
+
+  const cleanup = await tuiPlugin.setup({});
+  assert.equal(typeof cleanup, "function", "tui setup returns a disposer even with no ui.slot");
+  await cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// 6. Board state builder (lib/board.js): given 2 personal instinct files, a
+//    fake .observer-state.json / observations.jsonl, a task-observer
+//    fixture (2 open - one explicit, one by omission - 1 parked, a last
+//    review date, and a PENDING.md with 1 of 3 headings "installed"), and
+//    an eval fixture (x-workspace/iteration-2/benchmark.json, mirroring the
+//    schema skill-creator writes), produces the expected numbers, writes
+//    board-state.json atomically, and writes a pointer file that resolves
+//    back to it the same way the TUI side's own hashing would.
+// ---------------------------------------------------------------------------
+{
+  const { refreshBoardState } = await import("./lib/board.js");
+  const { pointerFilePath } = await import("./lib/board-pointer.js");
+
+  const { projectDir, dataDir } = makeProjectAndData("board");
+  const taskObserverRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "task-observer-"));
+  const evalRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "eval-"));
+
+  const options = {
+    python: "python3",
+    dataDir,
+    observer: { runIntervalMinutes: 5 },
+    board: { observationsRoot: taskObserverRoot, evalRoots: [evalRoot] },
+  };
+  const ctx = { location: { directory: projectDir } };
+  const project = await resolveProject(ctx, options);
+
+  // Two personal instinct files; no inherited, no global-personal files.
+  await writeInstinct(project.instincts_personal, { id: "a-instinct", trigger: "a", confidence: 0.5, domain: "d" }, "# A\n");
+  await writeInstinct(project.instincts_personal, { id: "b-instinct", trigger: "b", confidence: 0.5, domain: "d" }, "# B\n");
+
+  // Fake observer state: 5 lines counted 12 minutes ago.
+  const lastRunAt = new Date(Date.now() - 12 * 60000).toISOString();
+  await fs.mkdir(project.project_dir, { recursive: true });
+  await fs.writeFile(path.join(project.project_dir, ".observer-state.json"), JSON.stringify({ lastRunAt, lastLineCount: 5 }), "utf8");
+  // 19 observation lines on disk now: 14 pending since the last run.
+  await fs.writeFile(project.observations_file, Array.from({ length: 19 }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n", "utf8");
+
+  // task-observer fixture.
+  const logDir = path.join(taskObserverRoot, "skill-observations", "observation-log");
+  await fs.mkdir(logDir, { recursive: true });
+  await fs.writeFile(path.join(logDir, "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+  await fs.writeFile(path.join(logDir, "0002-open-by-omission.md"), "---\nid: 2\n---\nbody\n", "utf8");
+  await fs.writeFile(path.join(logDir, "0003-parked.md"), "---\nstatus: parked\n---\nbody\n", "utf8");
+  await fs.writeFile(path.join(taskObserverRoot, "skill-observations", "last-review-date.txt"), "2026-10-01\n", "utf8");
+  await fs.mkdir(path.join(taskObserverRoot, "skill-updates"), { recursive: true });
+  await fs.writeFile(
+    path.join(taskObserverRoot, "skill-updates", "PENDING.md"),
+    [
+      "# Staged updates manifest",
+      "",
+      "## 2026-10-01-a (first): installed",
+      "- done",
+      "",
+      "## 2026-10-02-b (second): staged",
+      "- pending",
+      "",
+      "## 2026-10-03-c (third): staged",
+      "- pending",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  // Eval fixture: mirrors the schema skill-creator writes at
+  // <workspace>/iteration-N/benchmark.json, verified against a live run's
+  // output (metadata.skill_name; run_summary.<config>.pass_rate.mean for
+  // the "with"-prefixed config and the other one; run_summary.delta.pass_rate).
+  const iterationDir = path.join(evalRoot, "x-workspace", "iteration-2");
+  await fs.mkdir(iterationDir, { recursive: true });
+  await fs.writeFile(
+    path.join(iterationDir, "benchmark.json"),
+    JSON.stringify({
+      metadata: { skill_name: "pr" },
+      run_summary: {
+        old_skill: { pass_rate: { mean: 0.08 } },
+        with_skill: { pass_rate: { mean: 0.92 } },
+        delta: { pass_rate: "+0.84" },
+      },
+    }),
+    "utf8",
+  );
+
+  const state = await refreshBoardState(ctx, options);
+
+  assert.equal(state.instincts.project, 2, "two personal instincts counted");
+  assert.equal(state.instincts.inherited, 0);
+  assert.equal(state.instincts.global, 0, "no global-personal instinct files");
+  assert.equal(state.instincts.lastRun, lastRunAt);
+  assert.equal(state.instincts.pendingObservations, 14, "19 lines on disk minus 5 counted last run");
+  assert.equal(
+    state.instincts.nextRunEligibleAt,
+    new Date(new Date(lastRunAt).getTime() + 5 * 60000).toISOString(),
+    "next run eligible 5 minutes after lastRunAt",
+  );
+
+  assert.equal(state.observations.available, true);
+  assert.equal(state.observations.open, 2, "status: open plus the file with no status line");
+  assert.equal(state.observations.parked, 1);
+  assert.equal(state.observations.lastReview, "2026-10-01");
+  assert.equal(state.observations.staged, 2, "1 of 3 headings says installed");
+
+  assert.equal(state.evals.available, true);
+  assert.equal(state.evals.skill, "pr");
+  assert.equal(state.evals.iteration, 2);
+  assert.equal(state.evals.withSkill, 0.92);
+  assert.equal(state.evals.baseline, 0.08);
+  assert.equal(state.evals.delta, 0.84);
+
+  // The state file and pointer file are both written, atomically, and the
+  // pointer resolves back to the exact state file path.
+  const stateFile = path.join(project.project_dir, "board-state.json");
+  const onDisk = JSON.parse(await fs.readFile(stateFile, "utf8"));
+  assert.deepEqual(onDisk, state, "board-state.json on disk matches the returned state");
+
+  const pointerPath = pointerFilePath(options, projectDir);
+  const pointer = JSON.parse(await fs.readFile(pointerPath, "utf8"));
+  assert.equal(pointer.boardStatePath, stateFile, "pointer file resolves to the real state file");
+}
+
+// ---------------------------------------------------------------------------
+// 7. /board summary text (lib/board-format.js) must never throw, including
+//    when the board has not been written yet or every section reports
+//    itself unavailable.
+// ---------------------------------------------------------------------------
+{
+  const { formatBoardSummary } = await import("./lib/board-format.js");
+
+  let missing;
+  assert.doesNotThrow(() => {
+    missing = formatBoardSummary(null, {});
+  }, "missing board state never throws");
+  assert.equal(typeof missing, "string");
+
+  const everythingUnavailable = {
+    updatedAt: new Date().toISOString(),
+    instincts: null,
+    observations: { open: 0, parked: 0, lastReview: null, staged: 0, root: "/nowhere", available: false },
+    evals: { skill: null, delta: null, withSkill: null, baseline: null, iteration: null, path: null, available: false },
+  };
+  let summary;
+  assert.doesNotThrow(() => {
+    summary = formatBoardSummary(everythingUnavailable, {});
+  }, "an all-unavailable board state never throws");
+  assert.equal(typeof summary, "string");
+  assert.ok(summary.includes("not found"), "unavailable sections render as 'not found'");
 }
 
 function buildFakeObserverOutput() {

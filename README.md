@@ -1,15 +1,19 @@
-# opencode-instincts
+# mighty-instincts
 
 An [OpenCode](https://opencode.ai) V2 plugin that observes session activity (tool calls and prompts) into a per-project log, periodically has a cheap model distil that log into small learned "instincts," and exposes [ECC](https://github.com/affaan-m/ECC)'s instinct CLI as slash commands. Nothing becomes live on its own: `/evolve` only writes inert markdown, the observer is off by default, and the plugin never injects instincts into a prompt.
 
+On the OpenCode 2 TUI it also adds a small sidebar board summarising four sources of the user's own observation/improvement tooling: **Review** (the mighty-reviewer plugin's current SHIP/NO-SHIP verdict for the session you are viewing), **Instincts** (this plugin's own counts and observer status), **Observations** (the task-observer skill's open/parked backlog and staged updates), and **Evals** (skill-creator's latest benchmark delta). Hosts without the sidebar can run `/board` for the same summary as plain text (minus Review, which only exists in the TUI).
+
 ## Install
+
+> `opencode-instincts` was this package's previous name. If your `opencode.json` still references it, replace it with `mighty-instincts`.
 
 Add the plugin to your `opencode.json` (project or global at `~/.config/opencode/opencode.json`):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-instincts"]
+  "plugins": ["mighty-instincts"]
 }
 ```
 
@@ -20,7 +24,7 @@ To set options, use the object form instead of the bare string:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-instincts",
+      "package": "mighty-instincts",
       "options": {
         "observer": { "enabled": true, "model": "anthropic/claude-haiku-4-5" }
       }
@@ -29,7 +33,7 @@ To set options, use the object form instead of the bare string:
 }
 ```
 
-Restart OpenCode. Requires Python 3 on `PATH` (the plugin runs ECC's vendored `instinct-cli.py` as a subprocess; nothing else is installed).
+Restart OpenCode. Requires Python 3 on `PATH` (the plugin runs ECC's vendored `instinct-cli.py` as a subprocess; nothing else is installed). On the OpenCode 2 TUI the sidebar board (`mighty-instincts/tui`) loads alongside the server plugin automatically; no extra configuration is needed.
 
 ### Options
 
@@ -50,13 +54,20 @@ All options are optional; defaults shown:
     "minObservations": 20,
     "maxAnalysisLines": 300,
     "notify": true
+  },
+  "board": {
+    "enabled": true,
+    "sections": { "review": true, "instincts": true, "observations": true, "evals": true },
+    "refreshSeconds": 30,
+    "observationsRoot": null,
+    "evalRoots": null
   }
 }
 ```
 
 | Option | Description |
 | --- | --- |
-| `disabled` | Skip registering everything (hooks, commands, tool). |
+| `disabled` | Skip registering everything (hooks, commands, tool, board). |
 | `dataDir` | Absolute path to use instead of the default ECC data directory; relative values are ignored with a warning. Maps to `CLV2_HOMUNCULUS_DIR` for the vendored CLI. |
 | `python` | Python interpreter to run `instinct-cli.py` with. |
 | `observePrompts` | Record user prompt text (scrubbed, clipped to 2000 chars) as `user_prompt` observations. |
@@ -66,10 +77,37 @@ All options are optional; defaults shown:
 | `observer.runIntervalMinutes` / `observer.minObservations` | Minimum time and minimum new observation count between automatic runs. |
 | `observer.maxAnalysisLines` | How many of the most recent observation lines to show the model per run. |
 | `observer.notify` | Post a synthetic summary message into the triggering session after a background run. |
+| `board.enabled` | Turn the sidebar board and the `/board` command off entirely. |
+| `board.sections.review` / `.instincts` / `.observations` / `.evals` | Show or hide one section of the board. |
+| `board.refreshSeconds` | How often the board state file is recomputed on a timer (it is also refreshed on plugin setup and after every observer run). |
+| `board.observationsRoot` | Absolute path (or one starting with `~/`) to the task-observer skill's data directory. Defaults to `~/.local/share/opencode/task-observer`. |
+| `board.evalRoots` | Array of absolute paths (or ones starting with `~/`) to search for skill-creator benchmark output. Defaults to `["~/.config/opencode/skills", "$TMPDIR/opencode"]`. |
+
+## The board
+
+The board is a small, read-only summary of four sources, written by the server half of the plugin to a per-project `board-state.json` file and polled every 30 seconds (or refreshed on request) by the TUI sidebar panel and by `/board`:
+
+- **Review**: whenever you are viewing a session that the [mighty-reviewer](https://github.com/Mightybeast12/mighty-reviewer) plugin reviewed (or is currently reviewing), its phase and, once finished, its SHIP/NO-SHIP verdict. Derived entirely in the TUI from live session data (title and status); mighty-instincts never talks to mighty-reviewer directly and does not need it installed. Only appears in the sidebar; `/board` never shows it.
+- **Instincts**: this plugin's own project/inherited/global instinct counts, when the observer last ran, how many observations are pending, and when the observer is next eligible to run.
+- **Observations**: the task-observer skill's open/parked observation counts, the last backlog review date, and how many staged skill updates are still pending.
+- **Evals**: the newest benchmark the skill-creator skill produced (skill name, iteration, the two pass rates it compared, and the delta between them).
+
+Each section is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts section is always this plugin's own data).
+
+### Where the board state lives
+
+```
+${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-homunculus}/
+├── board-pointer-<sha256(project directory)[0:12]>.json   # points at the file below
+└── projects/<project-hash>/
+    └── board-state.json
+```
+
+The TUI half knows the real project directory (`ctx.location.directory`) but not `<project-hash>` (ECC's own git-remote hash, resolved by a python subprocess the server half already runs). So the server half also writes a small pointer file, named only from a hash of the real directory path, holding the absolute path of the real state file. Both halves resolve the pointer file's own location the same way (the ECC data directory default chain above), so the TUI never needs to run python itself.
 
 ## What gets written, and where
 
-Everything lands in ECC's existing on-disk layout so `instinct-cli.py` (and anything else that reads it) sees the same data; the only additions are the two bookkeeping files marked below:
+Everything lands in ECC's existing on-disk layout so `instinct-cli.py` (and anything else that reads it) sees the same data; the only additions are the bookkeeping files marked below:
 
 ```
 ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-homunculus}/
@@ -78,6 +116,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     ├── observations.archive/       # rotated out at 10 MB
     ├── observer.log                # plugin addition: one line per observer run
     ├── .observer-state.json        # plugin addition: last run time + line count for the gate
+    ├── board-state.json            # plugin addition: the board's four-section summary
     └── instincts/
         ├── personal/<id>.md        # written by the observer
         └── inherited/<id>.md       # written by `/instinct-import`
@@ -97,6 +136,7 @@ Project identity (the `<project-hash>` above, or the shared `global` bucket when
 | `/instinct-projects` | List known projects and their instinct counts. |
 | `/instinct-prune [--dry-run] [--max-age N]` | Delete pending instincts older than the TTL. |
 | `/instinct-observe` | Run the observer right now, ignoring the enabled/interval/threshold gates. |
+| `/board` | Show the board summary as plain text (Instincts, Observe, Evals; Review only appears in the sidebar). |
 
 Every command runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
 
@@ -111,7 +151,7 @@ When `observer.enabled` is `true`, every observed tool call or prompt checks whe
 1. Reads the most recent observation lines (clipped per-field and capped in total size) plus the existing instinct list, so the model updates instincts instead of duplicating them.
 2. Calls `ctx.generate.text({ prompt, model })` once, with no tools available to the model.
 3. Parses `<instinct>...</instinct>` blocks out of the response, validates each one (id, trigger, confidence, domain, no stray `---` in the body), and writes the valid ones to `instincts/personal/`.
-4. Logs the result to `observer.log` and, if `observer.notify` is true, posts a summary into the session.
+4. Logs the result to `observer.log`, refreshes the board state, and, if `observer.notify` is true, posts a summary into the session.
 
 This is at most one `generate.text` call per interval, on whatever model you set in `observer.model`. `/instinct-observe` runs the same logic on demand, bypassing the enabled/interval/threshold gates (it still needs a model, from `observer.model` or the host default).
 
@@ -120,6 +160,7 @@ This is at most one `generate.text` call per interval, on whatever model you set
 - Observations contain scrubbed tool inputs/outputs and prompt text (the same credential-redaction pattern ECC's shell hook uses), clipped to a few thousand characters each.
 - Everything stays on disk under the data directory above. Nothing is sent anywhere except the one `generate.text` call per observer run, which goes to whichever model you configured.
 - Only instincts (small learned patterns), never raw observations, can be exported with `/instinct-export`.
+- The board state file contains only counts, dates, and short status strings (no observation or finding text).
 
 ## How this differs from ECC
 
@@ -135,7 +176,7 @@ OpenCode has no hook-daemon model and `ctx.generate.text` has no tools, so this 
 
 ## Attribution
 
-The instinct model, CLI, and observer prompt are from [affaan-m/ECC](https://github.com/affaan-m/ECC), vendored verbatim at commit `ef648e01899ba3e8dc6371642deaaf64b4477775` under `vendor/ecc/` (MIT License; see `NOTICE`).
+The instinct model, CLI, and observer prompt are from [affaan-m/ECC](https://github.com/affaan-m/ECC), vendored verbatim at commit `ef648e01899ba3e8dc6371642deaaf64b4477775` (MIT License; see `NOTICE`).
 
 ## Licence
 

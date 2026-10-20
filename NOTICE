@@ -1,4 +1,4 @@
-opencode-instincts
+mighty-instincts
 Copyright (c) 2026 Firat Honca
 
 This project ports the continuous-learning-v2 instinct system from ECC
@@ -38,6 +38,6 @@ ECC's original copyright notice (see vendor/ecc/LICENSE) is reproduced below:
   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   DEALINGS IN THE SOFTWARE.
 
-Everything outside vendor/ecc/ (index.js, lib/, smoke-test.mjs, README.md,
-package.json) is original work by Firat Honca, licensed under the MIT
-License in this repository's LICENSE file.
+Everything outside vendor/ecc/ (index.js, tui.js, sidebar.js, lib/,
+smoke-test.mjs, README.md, package.json) is original work by Firat Honca,
+licensed under the MIT License in this repository's LICENSE file.
