@@ -2,7 +2,7 @@
 
 An [OpenCode](https://opencode.ai) V2 plugin that observes session activity (tool calls and prompts) into a per-project log, periodically has a cheap model distil that log into small learned "instincts," and exposes [ECC](https://github.com/affaan-m/ECC)'s instinct CLI as slash commands. Nothing becomes live on its own: `/evolve` only writes inert markdown, the observer is off by default, and the plugin never injects instincts into a prompt.
 
-On the OpenCode 2 TUI it also adds a small sidebar board summarising four sources of the user's own observation/improvement tooling: **Review** (the mighty-reviewer plugin's current SHIP/NO-SHIP verdict for the session you are viewing), **Instincts** (this plugin's own counts and observer status), **Observations** (the task-observer skill's open/parked backlog and staged updates), and **Evals** (skill-creator's latest benchmark delta). Hosts without the sidebar can run `/board` for the same summary as plain text (minus Review, which only exists in the TUI).
+On the OpenCode 2 TUI it also adds a small, collapsible sidebar board summarising three sources of the user's own observation/improvement tooling: **Instincts** (this plugin's own counts and observer status), **Skill observations** (the task-observer skill's open/parked backlog and staged updates), and **Skill evals** (skill-creator's latest benchmark result). Hosts without the sidebar can run `/board` for the same summary as plain text.
 
 ## Install
 
@@ -57,10 +57,11 @@ All options are optional; defaults shown:
   },
   "board": {
     "enabled": true,
-    "sections": { "review": true, "instincts": true, "observations": true, "evals": true },
+    "sections": { "instincts": true, "observations": true, "evals": true },
     "refreshSeconds": 30,
     "observationsRoot": null,
-    "evalRoots": null
+    "evalRoots": null,
+    "compact": false
   }
 }
 ```
@@ -78,21 +79,36 @@ All options are optional; defaults shown:
 | `observer.maxAnalysisLines` | How many of the most recent observation lines to show the model per run. |
 | `observer.notify` | Post a synthetic summary message into the triggering session after a background run. |
 | `board.enabled` | Turn the sidebar board and the `/board` command off entirely. |
-| `board.sections.review` / `.instincts` / `.observations` / `.evals` | Show or hide one section of the board. |
+| `board.sections.instincts` / `.observations` / `.evals` | Show or hide one block of the board. |
+| `board.compact` | Start every board block collapsed to its title line only; still expandable by clicking. Does not affect the panel header. |
 | `board.refreshSeconds` | How often the board state file is recomputed on a timer (it is also refreshed on plugin setup and after every observer run). |
 | `board.observationsRoot` | Absolute path (or one starting with `~/`) to the task-observer skill's data directory. Defaults to `~/.local/share/opencode/task-observer`. |
 | `board.evalRoots` | Array of absolute paths (or ones starting with `~/`) to search for skill-creator benchmark output. Defaults to `["~/.config/opencode/skills", "$TMPDIR/opencode"]`. |
 
 ## The board
 
-The board is a small, read-only summary of four sources, written by the server half of the plugin to a per-project `board-state.json` file and polled every 30 seconds (or refreshed on request) by the TUI sidebar panel and by `/board`:
+The board is a small, read-only summary of three sources, written by the server half of the plugin to a per-project `board-state.json` file and polled every 30 seconds (or refreshed on request) by the TUI sidebar panel and by `/board`:
 
-- **Review**: whenever you are viewing a session that the [mighty-reviewer](https://github.com/Mightybeast12/mighty-reviewer) plugin reviewed (or is currently reviewing), its phase and, once finished, its SHIP/NO-SHIP verdict. Derived entirely in the TUI from live session data (title and status); mighty-instincts never talks to mighty-reviewer directly and does not need it installed. Only appears in the sidebar; `/board` never shows it.
 - **Instincts**: this plugin's own project/inherited/global instinct counts, when the observer last ran, how many observations are pending, and when the observer is next eligible to run.
-- **Observations**: the task-observer skill's open/parked observation counts, the last backlog review date, and how many staged skill updates are still pending.
-- **Evals**: the newest benchmark the skill-creator skill produced (skill name, iteration, the two pass rates it compared, and the delta between them).
+- **Skill observations**: the task-observer skill's open/parked observation counts, the last backlog review date, and how many staged skill updates are still pending.
+- **Skill evals**: the newest benchmark the skill-creator skill produced (skill name, iteration, and the two pass rates it compared).
 
-Each section is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts section is always this plugin's own data).
+Each block is independently optional (`board.sections`) and shows `!` / "not found" when its data source is not present (observations/evals only; the instincts block is always this plugin's own data).
+
+In the sidebar, the panel header and every block title are clickable: the header collapses the whole panel down to that one line, and a block title collapses just that block down to its title line. Both default to expanded (`board.compact: true` starts blocks collapsed instead); whichever state you leave them in is remembered across restarts. Fully expanded, the panel reads:
+
+```
+▾ Mighty Instincts
+▾ Instincts · haiku observer
+  5 learned here, 0 global
+  next run in 3m, 14 new events
+▾ Skill observations · task-observer
+  308 open, 2 parked
+  last review 3d ago, 1 staged
+▾ Skill evals · skill-creator
+  pr, iteration 2
+  92% with skill, 8% without
+```
 
 ### Where the board state lives
 
@@ -116,7 +132,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     ├── observations.archive/       # rotated out at 10 MB
     ├── observer.log                # plugin addition: one line per observer run
     ├── .observer-state.json        # plugin addition: last run time + line count for the gate
-    ├── board-state.json            # plugin addition: the board's four-section summary
+    ├── board-state.json            # plugin addition: the board's three-block summary
     └── instincts/
         ├── personal/<id>.md        # written by the observer
         └── inherited/<id>.md       # written by `/instinct-import`
@@ -136,7 +152,7 @@ Project identity (the `<project-hash>` above, or the shared `global` bucket when
 | `/instinct-projects` | List known projects and their instinct counts. |
 | `/instinct-prune [--dry-run] [--max-age N]` | Delete pending instincts older than the TTL. |
 | `/instinct-observe` | Run the observer right now, ignoring the enabled/interval/threshold gates. |
-| `/board` | Show the board summary as plain text (Instincts, Observe, Evals; Review only appears in the sidebar). |
+| `/board` | Show the board summary as plain text (Instincts, Skill observations, Skill evals). |
 
 Every command runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
 

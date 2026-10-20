@@ -493,6 +493,11 @@ function createPluginHarness(directory, options) {
   // <workspace>/iteration-N/benchmark.json, verified against a live run's
   // output (metadata.skill_name; run_summary.<config>.pass_rate.mean for
   // the "with"-prefixed config and the other one; run_summary.delta.pass_rate).
+  // The baseline config here is "without_skill" (the common naming), so
+  // state.evals.baselineKind should read "without"; the "old_skill" naming
+  // (baselineKind "old") is covered directly against lib/board-text.js in
+  // section 8 below, since board-evals.js's branch on the two names is a
+  // one-line condition not worth a second full fixture directory for.
   const iterationDir = path.join(evalRoot, "x-workspace", "iteration-2");
   await fs.mkdir(iterationDir, { recursive: true });
   await fs.writeFile(
@@ -500,7 +505,7 @@ function createPluginHarness(directory, options) {
     JSON.stringify({
       metadata: { skill_name: "pr" },
       run_summary: {
-        old_skill: { pass_rate: { mean: 0.08 } },
+        without_skill: { pass_rate: { mean: 0.08 } },
         with_skill: { pass_rate: { mean: 0.92 } },
         delta: { pass_rate: "+0.84" },
       },
@@ -532,6 +537,7 @@ function createPluginHarness(directory, options) {
   assert.equal(state.evals.iteration, 2);
   assert.equal(state.evals.withSkill, 0.92);
   assert.equal(state.evals.baseline, 0.08);
+  assert.equal(state.evals.baselineKind, "without", "without_skill baseline config reads as the 'without' naming convention");
   assert.equal(state.evals.delta, 0.84);
 
   // The state file and pointer file are both written, atomically, and the
@@ -547,8 +553,9 @@ function createPluginHarness(directory, options) {
 
 // ---------------------------------------------------------------------------
 // 7. /board summary text (lib/board-format.js) must never throw, including
-//    when the board has not been written yet or every section reports
-//    itself unavailable.
+//    when the board has not been written yet or every block reports itself
+//    unavailable, and must use the same titles/wording as the sidebar
+//    panel (lib/board-text.js), just as plain text.
 // ---------------------------------------------------------------------------
 {
   const { formatBoardSummary } = await import("./lib/board-format.js");
@@ -563,14 +570,135 @@ function createPluginHarness(directory, options) {
     updatedAt: new Date().toISOString(),
     instincts: null,
     observations: { open: 0, parked: 0, lastReview: null, staged: 0, root: "/nowhere", available: false },
-    evals: { skill: null, delta: null, withSkill: null, baseline: null, iteration: null, path: null, available: false },
+    evals: { skill: null, delta: null, withSkill: null, baseline: null, baselineKind: null, iteration: null, path: null, available: false },
   };
   let summary;
   assert.doesNotThrow(() => {
     summary = formatBoardSummary(everythingUnavailable, {});
   }, "an all-unavailable board state never throws");
   assert.equal(typeof summary, "string");
-  assert.ok(summary.includes("not found"), "unavailable sections render as 'not found'");
+  assert.ok(summary.includes("not found"), "unavailable observations/evals blocks render as 'not found'");
+  assert.ok(summary.includes("not available"), "a missing instincts section (no available flag of its own) renders as 'not available'");
+  assert.ok(summary.includes("Instincts \u00b7 observer"), "instincts title falls back to the bare 'observer' tool name with no model configured");
+  assert.ok(summary.includes("Skill observations \u00b7 task-observer"), "/board uses the same renamed title as the sidebar panel");
+  assert.ok(summary.includes("Skill evals \u00b7 skill-creator"), "/board uses the same renamed title as the sidebar panel");
+  assert.ok(!/[\u2014\u2013]/.test(summary), "/board text never contains an em or en dash");
+
+  const disabledSections = formatBoardSummary(everythingUnavailable, { board: { sections: { instincts: false, observations: false, evals: false } } });
+  assert.equal(disabledSections, "No board sections enabled.", "every block can be hidden independently");
+}
+
+// ---------------------------------------------------------------------------
+// 8. lib/board-text.js: the wording shared by the sidebar panel and
+//    /board, exercised directly (pure functions, no ctx needed) across
+//    every branch the redesign introduced.
+// ---------------------------------------------------------------------------
+{
+  const { instinctsToolName, instinctsLines, observationsLines, evalsLines } = await import("./lib/board-text.js");
+
+  assert.equal(instinctsToolName(null), "observer", "no instincts section at all falls back to 'observer'");
+  assert.equal(instinctsToolName({ model: null }), "observer", "no model configured falls back to 'observer'");
+  assert.equal(instinctsToolName({ model: "anthropic/claude-haiku-4-5" }), "haiku observer", "a haiku model reads as 'haiku observer'");
+  assert.equal(instinctsToolName({ model: "ANTHROPIC/CLAUDE-HAIKU" }), "haiku observer", "the haiku match is case-insensitive");
+  assert.equal(instinctsToolName({ model: "anthropic/claude-opus-4-1" }), "claude-opus-4-1", "a non-haiku model reads as its last path segment");
+  assert.equal(instinctsToolName({ model: "fakemodel" }), "fakemodel", "a model id with no '/' is used as-is");
+
+  assert.deepEqual(instinctsLines(null), ["not available"], "no instincts section renders a single fallback line");
+  assert.deepEqual(
+    instinctsLines({ project: 5, global: 0, inherited: 0, observerEnabled: true, lastRun: null, nextRunEligibleAt: null, pendingObservations: 14 }),
+    ["5 learned here, 0 global", "never run yet, 14 new events"],
+    "never run yet takes priority over the next-run-eligible wording",
+  );
+  assert.deepEqual(
+    instinctsLines({
+      project: 5,
+      global: 0,
+      inherited: 2,
+      observerEnabled: true,
+      lastRun: new Date().toISOString(),
+      nextRunEligibleAt: new Date(Date.now() + 3 * 60000).toISOString(),
+      pendingObservations: 14,
+    }),
+    ["5 learned here, 0 global, 2 inherited", "next run in 3m, 14 new events"],
+    "inherited > 0 is appended, and a future next-run time reads 'next run in'",
+  );
+  assert.deepEqual(
+    instinctsLines({
+      project: 5,
+      global: 0,
+      inherited: 0,
+      observerEnabled: true,
+      lastRun: new Date().toISOString(),
+      nextRunEligibleAt: new Date(Date.now() - 60000).toISOString(),
+      pendingObservations: 0,
+    }),
+    ["5 learned here, 0 global", "ready to run, 0 new events"],
+    "a past next-run time reads 'ready to run'",
+  );
+  assert.deepEqual(
+    instinctsLines({ project: 5, global: 0, inherited: 0, observerEnabled: false, lastRun: new Date().toISOString(), pendingObservations: 14 }),
+    ["5 learned here, 0 global", "observer off"],
+    "observerEnabled: false always reads 'observer off', even with a lastRun on record",
+  );
+
+  assert.deepEqual(observationsLines(null), ["not found"]);
+  assert.deepEqual(observationsLines({ available: false }), ["not found"]);
+  assert.deepEqual(
+    observationsLines({ available: true, open: 308, parked: 2, lastReview: null, staged: 1 }),
+    ["308 open, 2 parked", "last review never, 1 staged"],
+    "no last-review date reads 'last review never'",
+  );
+
+  assert.deepEqual(evalsLines(null), ["not found"]);
+  assert.deepEqual(evalsLines({ available: false }), ["not found"]);
+  assert.deepEqual(
+    evalsLines({ available: true, skill: "pr", iteration: 2, withSkill: 0.92, baseline: 0.08, baselineKind: "without" }),
+    ["pr, iteration 2", "92% with skill, 8% without"],
+    "the default/'without_skill' naming reads 'with skill'/'without'",
+  );
+  assert.deepEqual(
+    evalsLines({ available: true, skill: "pr", iteration: 2, withSkill: 0.92, baseline: 0.08, baselineKind: "old" }),
+    ["pr, iteration 2", "92% new, 8% old"],
+    "the 'old_skill' naming reads 'new'/'old' instead, and the delta is never shown",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 9. lib/board-interaction.js: the sidebar panel's collapsible state is
+//    pure (no solid-js/opentui), so its defaults and persisted-snapshot
+//    merge can be asserted directly here even though sidebar.js itself
+//    cannot be imported in this plain-node run (section 5 above).
+// ---------------------------------------------------------------------------
+{
+  const { defaultInteractionState, mergeInteractionState, BOARD_BLOCK_KEYS, BOARD_STORAGE_KEY } = await import("./lib/board-interaction.js");
+
+  assert.equal(BOARD_STORAGE_KEY, "mighty-instincts.board");
+  assert.deepEqual(BOARD_BLOCK_KEYS, ["instincts", "observations", "evals"]);
+
+  const expanded = defaultInteractionState({});
+  assert.equal(expanded.panelOpen, true, "the panel header always starts open");
+  assert.deepEqual(expanded.blocks, { instincts: true, observations: true, evals: true }, "board.compact defaults to false, so every block starts expanded");
+
+  const compact = defaultInteractionState({ board: { compact: true } });
+  assert.equal(compact.panelOpen, true, "board.compact never collapses the header, only blocks");
+  assert.deepEqual(compact.blocks, { instincts: false, observations: false, evals: false }, "board.compact: true seeds every block collapsed");
+
+  assert.deepEqual(mergeInteractionState(expanded, null), expanded, "no persisted snapshot keeps the defaults");
+  assert.deepEqual(mergeInteractionState(expanded, "not json"), expanded, "unparseable persisted JSON keeps the defaults");
+  assert.deepEqual(mergeInteractionState(expanded, 42), expanded, "a non-object, non-string persisted value keeps the defaults");
+
+  const persistedString = JSON.stringify({ panelOpen: false, blocks: { instincts: false, observations: "nope", bogusKey: true } });
+  const merged = mergeInteractionState(expanded, persistedString);
+  assert.equal(merged.panelOpen, false, "a persisted panelOpen boolean overrides the default, even read back as a JSON string");
+  assert.deepEqual(
+    merged.blocks,
+    { instincts: false, observations: true, evals: true },
+    "a persisted boolean overrides one block; a non-boolean value and an unknown key are both ignored, leaving the rest at their defaults",
+  );
+
+  const mergedFromObject = mergeInteractionState(compact, { blocks: { evals: true } });
+  assert.equal(mergedFromObject.panelOpen, true, "mergeInteractionState also accepts an already-parsed object, not just a JSON string");
+  assert.deepEqual(mergedFromObject.blocks, { instincts: false, observations: false, evals: true }, "merging over a compact-seeded default only changes the one block the snapshot named");
 }
 
 function buildFakeObserverOutput() {
