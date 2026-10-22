@@ -23,9 +23,21 @@ import {
   evolveStep,
   graduatePendingStep,
   promoteStep,
+  pruneCandidatesStep,
   pruneStep,
   repairStep,
 } from "./lib/maintain.js";
+import {
+  findCandidateById,
+  hashContent,
+  loadCandidates,
+  renderCandidateBody,
+  resolveEvolveTargets,
+  selectCandidateKind,
+  writeCandidate,
+} from "./lib/candidates.js";
+import { bumpUsage, commandNameFromPromptText, readUsage } from "./lib/usage.js";
+import { registerCommands } from "./lib/commands.js";
 
 // os.tmpdir() resolves under /private/var/folders in the sandboxes this
 // plugin is developed in; nesting under opencode/instincts-test keeps every
@@ -180,8 +192,23 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const commandNames = harness.commandDefs.map((def) => def.name).sort();
   assert.deepEqual(
     commandNames,
-    ["board", "evolve", "instinct-export", "instinct-import", "instinct-observe", "instinct-projects", "instinct-prune", "instinct-status", "promote"].sort(),
-    "all nine slash commands registered",
+    [
+      "board",
+      "evolve",
+      "evolve-archive",
+      "evolve-install",
+      "evolve-list",
+      "evolve-reject",
+      "evolve-show",
+      "instinct-export",
+      "instinct-import",
+      "instinct-observe",
+      "instinct-projects",
+      "instinct-prune",
+      "instinct-status",
+      "promote",
+    ].sort(),
+    "all fourteen slash commands registered",
   );
   assert.equal(harness.toolDefs.length, 1, "one tool registered");
   assert.equal(harness.toolDefs[0].id, "instincts", "tool id is instincts");
@@ -1206,10 +1233,39 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   });
   const candidatesRowIndex = withCandidates.rows.findIndex((row) => row.label === "skill candidates");
   assert.equal(withCandidates.rows[candidatesRowIndex].value, "2");
-  assert.equal(withCandidates.rows[candidatesRowIndex + 1]?.hint, "see /tmp/evolved");
+  assert.equal(withCandidates.rows[candidatesRowIndex + 1]?.hint, "run /evolve-list");
 
   const withoutCandidates = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 0, skillCandidates: 0 });
   assert.ok(!withoutCandidates.rows.some((row) => row.label === "skill candidates"), "skillCandidates: 0 omits the row entirely");
+
+  // --- "installed from habits" and "unused candidates" (0.8.0's evolve
+  //     lifecycle rows): both omitted at 0, both shown with the right
+  //     hint text once nonzero -----------------------------------------
+  const withInstalledAndUnused = buildInstinctsBlock({
+    project: 5,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    installedFromHabits: 3,
+    unusedCandidates: 1,
+  });
+  assert.ok(withInstalledAndUnused.rows.some((row) => row.label === "installed from habits" && row.value === "3"));
+  const unusedRowIndex = withInstalledAndUnused.rows.findIndex((row) => row.label === "unused candidates");
+  assert.equal(withInstalledAndUnused.rows[unusedRowIndex].value, "1");
+  assert.equal(withInstalledAndUnused.rows[unusedRowIndex + 1]?.hint, "see /evolve-list");
+
+  const withoutInstalledOrUnused = buildInstinctsBlock({
+    project: 5,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    installedFromHabits: 0,
+    unusedCandidates: 0,
+  });
+  assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.label === "installed from habits"), "installedFromHabits: 0 omits the row entirely");
+  assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.label === "unused candidates"), "unusedCandidates: 0 omits the row entirely");
 
   // --- "habits in prompts": a live eligibility count, shown even at 0
   //     (unlike "used by the agent today", a per-day tally that still
@@ -1911,9 +1967,12 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(mergedContent.includes("Observed 3 times") && mergedContent.includes("Observed 2 more times"), "the new evidence paragraph is appended to the existing ## Evidence section");
   assert.ok(dedupeLog.some((line) => line.includes("dedupe: merged new-habit into existing-habit")));
 
-  // --- evolve: three overlapping testing-domain instincts cluster -------
+  // --- evolve: three overlapping testing-domain instincts propose one
+  //     rule candidate (<= 3 members); re-running leaves it alone, and
+  //     archiving it blocks the same cluster from ever coming back ------
   const evolveProject = {
     project_dir: path.join(maintRoot, "proj-evolve"),
+    root: path.join(maintRoot, "proj-evolve"),
     instincts_personal: path.join(maintRoot, "proj-evolve", "instincts", "personal"),
     evolved_dir: path.join(maintRoot, "proj-evolve", "evolved"),
   };
@@ -1939,8 +1998,24 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(evolvedFiles.length, 1);
   const evolvedContent = await fs.readFile(path.join(evolveProject.evolved_dir, evolvedFiles[0]), "utf8");
   assert.ok(evolvedContent.includes("testing-habit-0") && evolvedContent.includes("testing-habit-1") && evolvedContent.includes("testing-habit-2"));
-  assert.ok(evolvedContent.includes("Suggested SKILL.md description"));
+  assert.ok(evolvedContent.includes("kind: rule"), "3 members (at or below the rule cutoff) proposes a rule candidate");
+  assert.ok(evolvedContent.includes("status: proposed"));
+  assert.ok(evolvedContent.includes("suggested_name: testing"));
   assert.ok(evolveLog.some((line) => line.includes("evolve: wrote cluster")));
+
+  const evolveLog2 = [];
+  const second = await evolveStep(evolveProject, { log: (line) => evolveLog2.push(line) });
+  assert.equal(second.candidates, 0, "re-running evolve against the exact same instincts proposes nothing new");
+  assert.equal((await fs.readdir(evolveProject.evolved_dir)).length, 1, "still exactly one candidate file, never duplicated");
+  assert.ok(evolveLog2.some((line) => line.includes("evolve: checked, no new clusters")));
+
+  const [proposedCandidate] = await loadCandidates(evolveProject.evolved_dir);
+  await writeCandidate(evolveProject.evolved_dir, { ...proposedCandidate.fields, status: "archived", reason: "test" }, proposedCandidate.body);
+  const evolveLog3 = [];
+  const third = await evolveStep(evolveProject, { log: (line) => evolveLog3.push(line) });
+  assert.equal(third.candidates, 0, "an archived candidate blocks its own cluster from ever being re-proposed");
+  assert.ok(evolveLog3.some((line) => line.includes("evolve: skipped cluster")));
+  assert.equal((await fs.readdir(evolveProject.evolved_dir)).length, 1, "still only the one, now-archived, candidate file");
 
   // --- classifyNewInstinct: the "50% rule" ------------------------------
   assert.equal(classifyNewInstinct({ confidence: 0.5 }, "# Body\n\n## Action\nDo it.\n"), "pending", "exactly 0.5 confidence with no Evidence section goes to pending");
@@ -1986,6 +2061,762 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   const secondRepair = await repairStep(repairProject, { log: () => {} });
   assert.equal(secondRepair, 0, "repairStep is idempotent: a clean trigger never matches the leaked-suffix pattern again");
+}
+
+// ---------------------------------------------------------------------------
+// 15. lib/candidates.js's selectCandidateKind, exercised through evolveStep
+//     against four domains: 4 members with run/check-verb summaries (->
+//     command), 4 members without (-> skill), 6 members (-> skill
+//     regardless of content), and 3 members mentioning delegation to a
+//     specialist subagent (-> agent, overriding the <= 3 "rule" default).
+//     Also covers the "update members in place" half of the no-duplicate
+//     rule: growing the command cluster by one still-overlapping member
+//     and re-running evolve updates that same candidate's members list
+//     instead of writing a second file for it.
+// ---------------------------------------------------------------------------
+{
+  const kindRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "evolve-kind-"));
+  const kindProject = {
+    project_dir: kindRoot,
+    root: kindRoot,
+    instincts_personal: path.join(kindRoot, "instincts", "personal"),
+    evolved_dir: path.join(kindRoot, "evolved"),
+  };
+  await fs.mkdir(kindProject.instincts_personal, { recursive: true });
+
+  async function seed(domain, count, { trigger, summary }) {
+    for (let i = 0; i < count; i++) {
+      await writeInstinct(
+        kindProject.instincts_personal,
+        {
+          id: `${domain}-habit-${i}`,
+          trigger: `${trigger} ${i}`,
+          confidence: 0.6,
+          domain,
+          summary: `${summary} ${i}.`,
+          created: new Date().toISOString(),
+        },
+        `# ${domain} ${i}\n`,
+      );
+    }
+  }
+
+  await seed("automation", 4, { trigger: "run the full linter and type checker before every commit", summary: "Run the linter and type checker before committing" });
+  await seed("docs", 4, { trigger: "write clear documentation comments for every public function", summary: "Write clear documentation comments for public functions" });
+  await seed("release", 6, { trigger: "tag a new release and update the changelog entry number", summary: "Tag a new release and update the changelog" });
+  await seed("handoff", 3, { trigger: "delegate the heavy lifting to a specialist subagent for task", summary: "Delegate complex work to a specialist subagent" });
+
+  await evolveStep(kindProject, { log: () => {} });
+  const kindCandidates = await loadCandidates(kindProject.evolved_dir);
+  assert.equal(kindCandidates.length, 4, "one candidate per domain");
+
+  const byDomain = (prefix) => kindCandidates.find((c) => c.fields.members[0]?.startsWith(prefix));
+  assert.equal(byDomain("automation-").fields.kind, "command", "4 members, summaries read as run/check steps -> command");
+  assert.equal(byDomain("docs-").fields.kind, "skill", "4 members, no run/check verbs in the summaries -> skill");
+  assert.equal(byDomain("release-").fields.kind, "skill", "6 members is always a skill, regardless of content");
+  assert.equal(byDomain("handoff-").fields.kind, "agent", "delegation/specialist language overrides the <= 3 'rule' default");
+
+  // Directly exercises selectCandidateKind with the same four shapes, so
+  // the unit itself (not just evolveStep's end-to-end wiring) is pinned.
+  const fakeMember = (id, summary) => ({ fields: { id, trigger: summary, summary } });
+  assert.equal(selectCandidateKind([fakeMember("a", "Run the tests."), fakeMember("b", "Run the tests."), fakeMember("c", "Run the tests."), fakeMember("d", "Run the tests.")]), "command");
+  assert.equal(selectCandidateKind([fakeMember("a", "Write docs."), fakeMember("b", "Write docs."), fakeMember("c", "Write docs."), fakeMember("d", "Write docs.")]), "skill");
+  assert.equal(selectCandidateKind(Array.from({ length: 6 }, (_, i) => fakeMember(`x${i}`, "Write docs."))), "skill");
+  assert.equal(selectCandidateKind([fakeMember("a", "Write docs.")]), "rule", "a single member with no delegation language is a rule");
+  assert.equal(selectCandidateKind([fakeMember("a", "Hand this off to a specialist.")]), "agent", "delegation language wins even for a single member");
+
+  // --- no-duplicate rule, "update members" half ------------------------
+  const automationId = byDomain("automation-").fields.id;
+  await seed("automation", 1, { trigger: "run the full linter and type checker before every commit", summary: "Run the linter and type checker before committing" });
+  // The new member reuses index 0 as well (seed always starts at i=0), so
+  // give it a distinct id by writing it directly instead of through seed().
+  await writeInstinct(
+    kindProject.instincts_personal,
+    { id: "automation-habit-4", trigger: "run the full linter and type checker before every commit 4", confidence: 0.6, domain: "automation", summary: "Run the linter and type checker before committing 4.", created: new Date().toISOString() },
+    "# automation 4\n",
+  );
+  const updateLog = [];
+  const updateResult = await evolveStep(kindProject, { log: (line) => updateLog.push(line) });
+  assert.equal(updateResult.candidates, 0, "growing an existing cluster never proposes a brand new candidate");
+  const afterUpdate = await loadCandidates(kindProject.evolved_dir);
+  assert.equal(afterUpdate.length, 4, "still exactly one candidate per domain, none duplicated");
+  const updatedAutomation = afterUpdate.find((c) => c.fields.id === automationId);
+  assert.equal(updatedAutomation.fields.members.length, 5, "the same candidate's members list grew in place");
+  assert.ok(updatedAutomation.fields.members.includes("automation-habit-4"));
+  assert.ok(updateLog.some((line) => line.includes(`evolve: updated cluster ${automationId} members (5 members)`)));
+}
+
+// ---------------------------------------------------------------------------
+// 16. lib/usage.js: bumpUsage increments {count, last} per bucket+key,
+//     concurrent bumps for the same key never lose an increment (the
+//     same read-modify-write race lib/inject.js's fired-miss log already
+//     guards against), readUsage always returns all three buckets even
+//     when usage.json does not exist yet, and commandNameFromPromptText
+//     parses a slash command's name and ignores everything else.
+// ---------------------------------------------------------------------------
+{
+  const usageRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "usage-"));
+
+  const empty = await readUsage(usageRoot);
+  assert.deepEqual(empty, { skills: {}, commands: {}, agents: {} }, "no usage.json yet reads as all-empty, not a throw");
+
+  await bumpUsage(usageRoot, "skills", "pr");
+  await bumpUsage(usageRoot, "skills", "pr");
+  const afterTwo = await readUsage(usageRoot);
+  assert.equal(afterTwo.skills.pr.count, 2);
+  assert.ok(typeof afterTwo.skills.pr.last === "string" && !Number.isNaN(Date.parse(afterTwo.skills.pr.last)));
+
+  await Promise.all(Array.from({ length: 10 }, () => bumpUsage(usageRoot, "commands", "evolve-list")));
+  const afterConcurrent = await readUsage(usageRoot);
+  assert.equal(afterConcurrent.commands["evolve-list"].count, 10, "10 concurrent bumps for the same key never lose an increment");
+
+  assert.equal(commandNameFromPromptText("/evolve-install abc"), "evolve-install");
+  assert.equal(commandNameFromPromptText("/board"), "board");
+  assert.equal(commandNameFromPromptText("  /evolve-list"), "evolve-list", "leading whitespace before the slash is tolerated");
+  assert.equal(commandNameFromPromptText("not a command"), null);
+  assert.equal(commandNameFromPromptText(""), null);
+  assert.equal(commandNameFromPromptText(undefined), null);
+}
+
+// ---------------------------------------------------------------------------
+// 17. lib/commands.js's candidate-lifecycle commands, against a temp HOME
+//     set through `evolve.targets` (an absolute dir per
+//     skill/command/agent, an absolute file for rule): /evolve-install's
+//     two-step confirm (preview without --yes installs nothing; --yes
+//     installs for every kind, including the AGENTS.md rule append, each
+//     carrying candidate_id/project_id/members markers and an
+//     installed_hash), /evolve-show and /evolve-list <id> rendering the
+//     same detail, refusing to overwrite a hand-written file (even one
+//     whose own prose merely mentions the marker text), refusing a file
+//     that belongs to a different candidate_id, /evolve-reject archiving
+//     a proposed candidate (and refusing to "reject" an installed one),
+//     and /evolve-archive removing an installed file only when ownership
+//     and content both still match, leaving a hand-edited one in place
+//     with a reason instead.
+// ---------------------------------------------------------------------------
+{
+  const { projectDir: cmdProjectDir, dataDir: cmdDataDir } = makeProjectAndData("evolve-commands");
+  const tmpHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "evolve-home-"));
+  const targets = {
+    skill: path.join(tmpHome, "skills"),
+    command: path.join(tmpHome, "commands"),
+    agent: path.join(tmpHome, "agents"),
+    rule: path.join(tmpHome, "AGENTS.md"),
+  };
+  const cmdOptions = { python: "python3", dataDir: cmdDataDir, evolve: { targets } };
+  const cmdCtx = { location: { directory: cmdProjectDir } };
+  const cmdProject = await resolveProject(cmdCtx, cmdOptions);
+
+  const harness = createPluginHarness(cmdProjectDir, cmdOptions);
+  await registerCommands(harness.ctx, cmdOptions, { run: async () => {} }, { refresh: async () => null });
+  const findCmd = (name) => harness.commandDefs.find((def) => def.name === name);
+  const lastReply = () => harness.syntheticCalls.at(-1).text;
+
+  async function seedCandidate(kind, id, suggestedName, members) {
+    const cluster = members.map((memberId) => ({ fields: { id: memberId, trigger: `trigger for ${memberId}`, summary: `Do the ${memberId} thing.` } }));
+    const body = renderCandidateBody(kind, "testing", cluster, suggestedName);
+    await writeCandidate(
+      cmdProject.evolved_dir,
+      { id, kind, status: "proposed", created: new Date().toISOString(), members, summary: "A test candidate.", suggested_name: suggestedName },
+      body,
+    );
+  }
+
+  // --- /evolve-install without --yes: previews, writes nothing --------
+  await seedCandidate("skill", "skillcand1", "my-skill", ["m1", "m2", "m3", "m4"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
+  const previewReply = lastReply();
+  assert.ok(previewReply.includes("kind: skill") && previewReply.includes("--- body ---"), "the preview shows kind and the full drafted body");
+  assert.ok(previewReply.includes("Re-run with --yes to install."), "no --yes: stops with the re-run instruction");
+  await assert.rejects(fs.access(path.join(targets.skill, "my-skill", "SKILL.md")), "nothing was written without --yes");
+  const stillProposed = await findCandidateById(cmdProject.evolved_dir, "skillcand1");
+  assert.equal(stillProposed.fields.status, "proposed", "previewing never changes the candidate's own status");
+
+  // /evolve-show renders the identical detail, on demand, without --yes
+  // ever being relevant to it (it never appends the install re-run hint).
+  await findCmd("evolve-show").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
+  const showReply = lastReply();
+  assert.ok(previewReply.startsWith(showReply.slice(0, -4)), "/evolve-install's own preview starts with /evolve-show's exact detail");
+  assert.ok(!showReply.includes("Re-run with --yes to install."), "/evolve-show never appends the install re-run hint");
+
+  // /evolve-list <id> renders the same detail too.
+  await findCmd("evolve-list").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
+  assert.equal(lastReply(), showReply, "/evolve-list <id> is another alias for the same single-candidate detail");
+
+  // --- /evolve-install --yes: skill, command, agent, and the AGENTS.md rule
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "skillcand1 --yes" } });
+  assert.ok(lastReply().includes("Restart OpenCode to load it."), "install ends with the restart instruction");
+  const skillFile = path.join(targets.skill, "my-skill", "SKILL.md");
+  const skillContent = await fs.readFile(skillFile, "utf8");
+  assert.ok(skillContent.includes("name: my-skill"));
+  assert.ok(skillContent.includes("generated_by: mighty-instincts"));
+  assert.ok(skillContent.includes("candidate_id: skillcand1"));
+  assert.ok(skillContent.includes(`project_id: ${cmdProject.id}`));
+  assert.ok(skillContent.includes("members: [m1, m2, m3, m4]"));
+  const skillCandidateAfter = await findCandidateById(cmdProject.evolved_dir, "skillcand1");
+  assert.equal(skillCandidateAfter.fields.status, "installed");
+  assert.ok(typeof skillCandidateAfter.fields.installed_at === "string");
+  assert.equal(skillCandidateAfter.fields.installed_hash, hashContent(skillContent), "installed_hash matches exactly what was written");
+
+  await seedCandidate("command", "cmdcand1", "my-cmd", ["m1", "m2"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "cmdcand1 --yes" } });
+  const cmdFile = path.join(targets.command, "my-cmd.md");
+  const cmdContent = await fs.readFile(cmdFile, "utf8");
+  assert.ok(cmdContent.includes("description:"));
+  assert.ok(cmdContent.includes("generated_by: mighty-instincts"));
+  assert.ok(cmdContent.includes("candidate_id: cmdcand1"));
+
+  await seedCandidate("agent", "agentcand1", "my-agent", ["m1"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "agentcand1 --yes" } });
+  const agentFile = path.join(targets.agent, "my-agent.md");
+  const agentContent = await fs.readFile(agentFile, "utf8");
+  assert.ok(agentContent.includes("mode: subagent"));
+  assert.ok(agentContent.includes("candidate_id: agentcand1"));
+
+  await seedCandidate("rule", "rulecand1", "my-rule", ["m1", "m2"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "rulecand1 --yes" } });
+  const ruleContent = await fs.readFile(targets.rule, "utf8");
+  assert.ok(ruleContent.includes("## Learned rules (mighty-instincts)"));
+  assert.ok(ruleContent.includes(`<!-- generated_by: mighty-instincts candidate_id: rulecand1 project_id: ${cmdProject.id} -->`));
+  assert.ok(ruleContent.includes("<!-- /generated_by: mighty-instincts candidate_id: rulecand1 -->"));
+  const ruleCandidateAfter = await findCandidateById(cmdProject.evolved_dir, "rulecand1");
+  assert.equal(ruleCandidateAfter.fields.status, "installed");
+
+  // --- refuse to overwrite a hand-written file, even one whose own
+  //     prose merely mentions the marker text (not a real frontmatter
+  //     field) ---------------------------------------------------------
+  await fs.mkdir(path.join(targets.skill, "hand-written"), { recursive: true });
+  await fs.writeFile(
+    path.join(targets.skill, "hand-written", "SKILL.md"),
+    "---\nname: hand-written\ndescription: a human wrote this\n---\n\nSee generated_by: mighty-instincts for how that other plugin works. Do not touch.\n",
+    "utf8",
+  );
+  await seedCandidate("skill", "skillcand2", "hand-written", ["m1", "m2", "m3", "m4"]);
+  await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand2 --yes" } });
+  const refuseReply = lastReply();
+  assert.ok(refuseReply.includes("Refused:") && refuseReply.includes("not written by mighty-instincts"), "marker text merely in the body's prose is never mistaken for a real marker");
+  const untouched = await fs.readFile(path.join(targets.skill, "hand-written", "SKILL.md"), "utf8");
+  assert.ok(untouched.includes("Do not touch."), "the hand-written file is left exactly as it was");
+  const skillCandidate2After = await findCandidateById(cmdProject.evolved_dir, "skillcand2");
+  assert.equal(skillCandidate2After.fields.status, "proposed", "a refused install never flips the candidate's own status");
+
+  // --- refuse a file that is genuinely ours, but for a different
+  //     candidate_id (e.g. a leftover from an earlier, differently-
+  //     proposed cluster that happened to pick the same suggested_name)
+  // -------------------------------------------------------------------
+  await fs.mkdir(path.join(targets.skill, "shared-name"), { recursive: true });
+  await fs.writeFile(
+    path.join(targets.skill, "shared-name", "SKILL.md"),
+    `---\nname: shared-name\ndescription: owned by another candidate\ngenerated_by: mighty-instincts\ncandidate_id: some-other-candidate\nproject_id: ${cmdProject.id}\nmembers: [x1]\n---\n\nBody.\n`,
+    "utf8",
+  );
+  await seedCandidate("skill", "skillcand3", "shared-name", ["m1", "m2", "m3", "m4"]);
+  await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand3 --yes" } });
+  assert.ok(lastReply().includes("Refused:"), "a file genuinely ours, but for a different candidate_id, is still refused");
+  const untouchedOther = await fs.readFile(path.join(targets.skill, "shared-name", "SKILL.md"), "utf8");
+  assert.ok(untouchedOther.includes("owned by another candidate"), "the other candidate's installed file is left exactly as it was");
+
+  // --- /evolve-reject: proposed -> archived with a reason ---------------
+  await seedCandidate("rule", "rejectcand1", "reject-me", ["m1", "m2"]);
+  await findCmd("evolve-reject").execute({ sessionID: "s3", prompt: { text: "rejectcand1 not useful here" } });
+  assert.ok(lastReply().includes("Archived candidate 'rejectcand1' (reason: not useful here)."));
+  const rejectedCandidate = await findCandidateById(cmdProject.evolved_dir, "rejectcand1");
+  assert.equal(rejectedCandidate.fields.status, "archived");
+  assert.equal(rejectedCandidate.fields.reason, "not useful here");
+
+  await findCmd("evolve-reject").execute({ sessionID: "s3", prompt: { text: "cmdcand1" } });
+  assert.ok(lastReply().includes("use /evolve-archive to remove it instead"), "rejecting an already-installed candidate points at /evolve-archive instead");
+
+  // --- /evolve-archive: removes the installed file when ownership and
+  //     content both still match, but leaves a hand-edited one in place
+  //     with a reason --------------------------------------------------
+  await findCmd("evolve-archive").execute({ sessionID: "s4", prompt: { text: "cmdcand1" } });
+  assert.ok(lastReply().includes(`Removed ${cmdFile}`));
+  await assert.rejects(fs.readFile(cmdFile, "utf8"), "the installed command file is actually gone");
+  const archivedCmdCandidate = await findCandidateById(cmdProject.evolved_dir, "cmdcand1");
+  assert.equal(archivedCmdCandidate.fields.status, "archived");
+
+  // my-agent.md still carries its own marker, but its content no longer
+  // hashes to what was installed: archive must leave it in place.
+  await fs.writeFile(agentFile, `${agentContent}\n\nA human added this line after install.\n`, "utf8");
+  await findCmd("evolve-archive").execute({ sessionID: "s5", prompt: { text: "agentcand1" } });
+  const archiveBlockedReply = lastReply();
+  assert.ok(archiveBlockedReply.includes("left in place") && archiveBlockedReply.includes("hand-edited"), "a hash mismatch is reported as hand-edited, not as a missing marker");
+  const agentFileStillThere = await fs.readFile(agentFile, "utf8");
+  assert.ok(agentFileStillThere.includes("A human added this line after install."), "the hand-edited agent file is never deleted");
+  const archivedAgentCandidate = await findCandidateById(cmdProject.evolved_dir, "agentcand1");
+  assert.equal(archivedAgentCandidate.fields.status, "archived", "the candidate itself is still archived even though its file was left alone");
+
+  // --- /evolve-list: a quick sanity check on the summary line ----------
+  await findCmd("evolve-list").execute({ sessionID: "s6", prompt: { text: "" } });
+  const listReply = lastReply();
+  assert.ok(/\d+ candidate\(s\): \d+ proposed, \d+ installed, \d+ archived\./.test(listReply));
+  assert.ok(listReply.includes("skillcand1 [skill] status=installed"));
+
+  await Promise.allSettled(harness.registrations.map((registration) => registration?.dispose?.()));
+}
+
+// ---------------------------------------------------------------------------
+// 17a. lib/candidates.js's bracketed rule markers (P1 fix): installing two
+//      rule candidates under the same AGENTS.md heading, then archiving
+//      one, must never disturb the other's block or any hand-written
+//      text under that same heading. Also covers idempotent re-install
+//      (a retried /evolve-install for a block already present never
+//      duplicates it) and CRLF preservation.
+// ---------------------------------------------------------------------------
+{
+  const { appendRuleBlock, removeRuleBlock } = await import("./lib/candidates.js");
+
+  let agentsContent = "# My Project\n\nSome existing instructions.\n";
+  agentsContent = appendRuleBlock(agentsContent, "cand-a", "proj-1", "- Rule A text.");
+  agentsContent = appendRuleBlock(agentsContent, "cand-b", "proj-1", "- Rule B text.");
+  // A human adds their own paragraph right under the heading, between
+  // the two generated blocks' neighbourhood, exactly the kind of content
+  // the old "consume to the next blank line" removal used to eat.
+  agentsContent += "\n- A hand-written rule a human added here.\n";
+
+  assert.ok(agentsContent.includes("Some existing instructions."), "pre-existing file content survives the first append");
+  assert.ok(agentsContent.includes("Rule A text.") && agentsContent.includes("Rule B text."));
+
+  const { content: afterArchiveB, removed } = removeRuleBlock(agentsContent, "cand-b");
+  assert.equal(removed, true);
+  assert.ok(afterArchiveB.includes("Rule A text."), "archiving candidate B leaves candidate A's block intact");
+  assert.ok(!afterArchiveB.includes("Rule B text."), "candidate B's own block is actually gone");
+  assert.ok(afterArchiveB.includes("A hand-written rule a human added here."), "a human's own text under the heading survives byte for byte");
+  assert.ok(afterArchiveB.includes("Some existing instructions."), "content above the heading is untouched");
+
+  // Idempotent re-append: a retried install (e.g. after a crash between
+  // writing AGENTS.md and flipping the candidate's own status) never
+  // duplicates the block. Each block carries exactly one start marker
+  // and one end marker, both naming the candidate_id, so a single block
+  // matches this twice; re-appending must leave that count unchanged.
+  const beforeReappendCount = (afterArchiveB.match(/candidate_id: cand-a\b/g) ?? []).length;
+  assert.equal(beforeReappendCount, 2, "one start marker and one end marker for candidate A's own block");
+  const reAppended = appendRuleBlock(afterArchiveB, "cand-a", "proj-1", "- Rule A text.");
+  assert.equal((reAppended.match(/candidate_id: cand-a\b/g) ?? []).length, 2, "re-appending a block that is already present never duplicates its markers");
+  assert.equal(reAppended, afterArchiveB, "re-appending an already-present block changes nothing at all");
+
+  // CRLF preservation: a Windows-style AGENTS.md keeps CRLF throughout,
+  // including the newly appended block.
+  const crlfContent = "# Title\r\n\r\nExisting line.\r\n";
+  const crlfAppended = appendRuleBlock(crlfContent, "cand-crlf", "proj-1", "- CRLF rule.");
+  assert.ok(crlfAppended.includes("Existing line.\r\n"), "pre-existing CRLF lines are untouched");
+  assert.ok(!crlfAppended.replace(/\r\n/g, "").includes("\n"), "no bare LF is introduced into an all-CRLF file");
+  const { content: crlfRemoved } = removeRuleBlock(crlfAppended, "cand-crlf");
+  assert.ok(crlfRemoved.includes("Existing line.\r\n") && !crlfRemoved.includes("CRLF rule."));
+}
+
+// ---------------------------------------------------------------------------
+// 17b. Cross-project clobber protection (P2/P3): two unrelated projects
+//      whose `evolve.targets.skill` happens to point at the exact same
+//      shared directory (the realistic case: the real default
+//      `~/.config/opencode/skills` is shared across every project on a
+//      machine). Installing candidate B from project 2 must never
+//      overwrite or archive-delete candidate A's file from project 1,
+//      even though both are genuinely "generated_by: mighty-instincts".
+// ---------------------------------------------------------------------------
+{
+  const sharedHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "cross-project-home-"));
+  const sharedTargets = { skill: path.join(sharedHome, "skills"), command: path.join(sharedHome, "commands"), agent: path.join(sharedHome, "agents"), rule: path.join(sharedHome, "AGENTS.md") };
+
+  const { projectDir: proj1Dir, dataDir: proj1Data } = makeProjectAndData("cross-proj-1");
+  const { projectDir: proj2Dir, dataDir: proj2Data } = makeProjectAndData("cross-proj-2");
+  const options1 = { python: "python3", dataDir: proj1Data, evolve: { targets: sharedTargets } };
+  const options2 = { python: "python3", dataDir: proj2Data, evolve: { targets: sharedTargets } };
+  const project1 = await resolveProject({ location: { directory: proj1Dir } }, options1);
+  const project2 = await resolveProject({ location: { directory: proj2Dir } }, options2);
+  assert.notEqual(project1.id, project2.id, "the two fixture projects really do have distinct ids");
+
+  const harness1 = createPluginHarness(proj1Dir, options1);
+  await registerCommands(harness1.ctx, options1, { run: async () => {} }, { refresh: async () => null });
+  const harness2 = createPluginHarness(proj2Dir, options2);
+  await registerCommands(harness2.ctx, options2, { run: async () => {} }, { refresh: async () => null });
+
+  const cluster = (memberId) => [{ fields: { id: memberId, trigger: `t ${memberId}`, summary: `Do ${memberId}.` } }];
+  await writeCandidate(
+    project1.evolved_dir,
+    { id: "proj1-cand", kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "shared" },
+    renderCandidateBody("skill", "testing", cluster("m1"), "shared"),
+  );
+  await writeCandidate(
+    project2.evolved_dir,
+    { id: "proj2-cand", kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m2"], summary: "s", suggested_name: "shared" },
+    renderCandidateBody("skill", "testing", cluster("m2"), "shared"),
+  );
+
+  await harness1.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p1", prompt: { text: "proj1-cand --yes" } });
+  const installedByProj1 = await fs.readFile(path.join(sharedTargets.skill, "shared", "SKILL.md"), "utf8");
+  assert.ok(installedByProj1.includes(`project_id: ${project1.id}`));
+
+  await harness2.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p2", prompt: { text: "proj2-cand --yes" } });
+  const refusedReply = harness2.syntheticCalls.at(-1).text;
+  assert.ok(refusedReply.includes("Refused:"), "project 2 cannot install over project 1's own candidate at the shared path");
+  const stillProj1 = await fs.readFile(path.join(sharedTargets.skill, "shared", "SKILL.md"), "utf8");
+  assert.equal(stillProj1, installedByProj1, "project 1's installed file is byte-for-byte unchanged");
+  const proj2CandidateAfter = await findCandidateById(project2.evolved_dir, "proj2-cand");
+  assert.equal(proj2CandidateAfter.fields.status, "proposed", "the refused install never flips project 2's own candidate status");
+
+  // Project 2 cannot archive-delete project 1's file either, even if it
+  // somehow ends up marked "installed" locally (e.g. a stale copy of
+  // its own evolved/ record from before a project id changed).
+  await writeCandidate(
+    project2.evolved_dir,
+    { id: "proj2-cand", kind: "skill", status: "installed", created: new Date().toISOString(), members: ["m2"], summary: "s", suggested_name: "shared", project_id: project2.id, installed_at: new Date().toISOString() },
+    renderCandidateBody("skill", "testing", cluster("m2"), "shared"),
+  );
+  await harness2.commandDefs.find((def) => def.name === "evolve-archive").execute({ sessionID: "p2", prompt: { text: "proj2-cand" } });
+  const archiveReply2 = harness2.syntheticCalls.at(-1).text;
+  assert.ok(archiveReply2.includes("left in place"), "project 2 can never archive-delete a file owned by project 1's candidate_id/project_id");
+  const stillProj1AfterArchive = await fs.readFile(path.join(sharedTargets.skill, "shared", "SKILL.md"), "utf8");
+  assert.equal(stillProj1AfterArchive, installedByProj1, "project 1's file survives project 2's archive attempt too");
+
+  await Promise.allSettled([...harness1.registrations, ...harness2.registrations].map((registration) => registration?.dispose?.()));
+}
+
+// ---------------------------------------------------------------------------
+// 17c. Install-time filesystem safety (P3): a symlink at the install
+//      target is refused outright for a skill/command/agent (never
+//      followed, never replaced), and a rule's AGENTS.md write goes
+//      through atomicWriteAgentsFile, which resolves a symlinked
+//      AGENTS.md to its real file (writing through it, not replacing
+//      the symlink) and writes via tmp-then-rename in that real
+//      directory.
+// ---------------------------------------------------------------------------
+{
+  const symlinkHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "symlink-home-"));
+  const targets = { skill: path.join(symlinkHome, "skills"), command: path.join(symlinkHome, "commands"), agent: path.join(symlinkHome, "agents"), rule: path.join(symlinkHome, "AGENTS.md") };
+  const { projectDir, dataDir } = makeProjectAndData("symlink-install");
+  const options = { python: "python3", dataDir, evolve: { targets } };
+  const ctx = { location: { directory: projectDir } };
+  const project = await resolveProject(ctx, options);
+
+  const harness = createPluginHarness(projectDir, options);
+  await registerCommands(harness.ctx, options, { run: async () => {} }, { refresh: async () => null });
+
+  // A symlink sitting at the would-be skill target, pointing somewhere
+  // else entirely.
+  const elsewhere = path.join(symlinkHome, "elsewhere.txt");
+  await fs.writeFile(elsewhere, "not a skill\n", "utf8");
+  await fs.mkdir(path.join(targets.skill, "linked"), { recursive: true });
+  await fs.symlink(elsewhere, path.join(targets.skill, "linked", "SKILL.md"));
+
+  await writeCandidate(
+    project.evolved_dir,
+    { id: "symcand1", kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "linked" },
+    renderCandidateBody("skill", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }], "linked"),
+  );
+  await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s1", prompt: { text: "symcand1 --yes" } });
+  const symlinkReply = harness.syntheticCalls.at(-1).text;
+  assert.ok(symlinkReply.includes("Refused:") && symlinkReply.includes("symlink"), "install never follows or replaces a symlinked target");
+  assert.equal(await fs.readFile(elsewhere, "utf8"), "not a skill\n", "the symlink's real target is completely untouched");
+
+  // AGENTS.md as a symlink: the rule install writes through to the real
+  // file, in its real directory, rather than replacing the symlink.
+  const realAgentsDir = fsSync.mkdtempSync(path.join(TEMP_ROOT, "real-agents-dir-"));
+  const realAgentsFile = path.join(realAgentsDir, "AGENTS.md");
+  await fs.writeFile(realAgentsFile, "# Real file\n", "utf8");
+  await fs.symlink(realAgentsFile, targets.rule);
+
+  await writeCandidate(
+    project.evolved_dir,
+    { id: "rulesym1", kind: "rule", status: "proposed", created: new Date().toISOString(), members: ["m1", "m2"], summary: "s", suggested_name: "rulesym" },
+    renderCandidateBody("rule", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }, { fields: { id: "m2", trigger: "t", summary: "Do it too." } }], "rulesym"),
+  );
+  await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s2", prompt: { text: "rulesym1 --yes" } });
+  const ruleSymReply = harness.syntheticCalls.at(-1).text;
+  assert.ok(ruleSymReply.includes("Restart OpenCode to load it."), "a symlinked AGENTS.md is written through, not refused");
+  assert.ok(fsSync.lstatSync(targets.rule).isSymbolicLink(), "the symlink itself is still a symlink (never replaced by a real file)");
+  const realContent = await fs.readFile(realAgentsFile, "utf8");
+  assert.ok(realContent.includes("# Real file") && realContent.includes("## Learned rules (mighty-instincts)"), "the real target file received the new content, alongside what it already had");
+
+  await Promise.allSettled(harness.registrations.map((registration) => registration?.dispose?.()));
+}
+
+// ---------------------------------------------------------------------------
+// 18. lib/observe.js's usage tracking (0.8.0): a `skill` tool call counts
+//     into usage.json's `skills` bucket by input.id, a `subagent`/`task`
+//     tool call counts into `agents` by input.agent, and a slash-command
+//     prompt counts into `commands` by name, all independent of whether
+//     the name happens to match something this plugin generated. Once an
+//     installed candidate's own suggested_name is used this way, every
+//     one of its member instincts gets `fired` bumped (the same feedback
+//     lib/inject.js's own trigger-match path uses), so the habits behind
+//     a useful artefact are exempt from decayStep.
+// ---------------------------------------------------------------------------
+{
+  const { projectDir: obsProjectDir, dataDir: obsDataDir } = makeProjectAndData("usage-observe");
+  const obsOptions = { python: "python3", dataDir: obsDataDir, board: { enabled: false } };
+  const harness = createPluginHarness(obsProjectDir, obsOptions);
+  const cleanup = await setup(harness.ctx);
+  const project = await resolveProject(harness.ctx, obsOptions);
+
+  // A member instinct the installed "skill" candidate below points back
+  // to; feedback should bump its `fired` count once the skill is used.
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "member-habit", trigger: "member trigger", confidence: 0.7, domain: "testing", summary: "Member habit.", created: new Date().toISOString() },
+    "# Member\n",
+  );
+  await writeCandidate(
+    project.evolved_dir,
+    { id: "usagecand1", kind: "skill", status: "installed", created: new Date().toISOString(), members: ["member-habit"], summary: "s", suggested_name: "used-skill", installed_at: new Date().toISOString() },
+    renderCandidateBody("skill", "testing", [{ fields: { id: "member-habit", trigger: "t", summary: "Member habit." } }], "used-skill"),
+  );
+
+  await harness.toolHooks["execute.before"]({ tool: "skill", sessionID: "u1", agent: "build", input: { id: "used-skill" } });
+  await harness.toolHooks["execute.before"]({ tool: "subagent", sessionID: "u1", agent: "build", input: { agent: "explore" } });
+  await harness.sessionHooks.prompt({ prompt: { text: "/evolve-list" }, sessionID: "u1" });
+
+  const usageAfter = await readUsage(project.project_dir);
+  assert.equal(usageAfter.skills["used-skill"].count, 1, "the skill tool's own call counted by input.id");
+  assert.equal(usageAfter.agents.explore.count, 1, "the subagent tool's own call counted by input.agent");
+  assert.equal(usageAfter.commands["evolve-list"].count, 1, "a slash-command prompt counted by its command name");
+
+  const memberAfter = await fs.readFile(path.join(project.instincts_personal, "member-habit.md"), "utf8");
+  assert.ok(/fired:\s*1/.test(memberAfter), "using the installed candidate's own suggested_name bumped its member instinct's fired count");
+
+  // P2 fix: a host naming its skill tool's id field `name`, or its
+  // subagent tool's agent field `subagent_type`, is still counted.
+  await harness.toolHooks["execute.before"]({ tool: "skill", sessionID: "u2", agent: "build", input: { name: "used-skill" } });
+  await harness.toolHooks["execute.before"]({ tool: "task", sessionID: "u2", agent: "build", input: { subagent_type: "explore" } });
+  const usageAfterFallback = await readUsage(project.project_dir);
+  assert.equal(usageAfterFallback.skills["used-skill"].count, 2, "input.name is accepted when input.id is absent");
+  assert.equal(usageAfterFallback.agents.explore.count, 2, "input.subagent_type is accepted when input.agent is absent, on the 'task' tool name too");
+
+  await cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// 18a. lib/candidates.js's loadCandidates validation (P3): a candidate
+//      file with a malformed id, a filename that does not match its own
+//      `id:` field, or a malformed `suggested_name` is skipped (with a
+//      warning) instead of being loaded, since both fields end up as
+//      real filesystem path segments (installPathFor).
+// ---------------------------------------------------------------------------
+{
+  const validateRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "candidate-validate-"));
+  const goodId = "good-cand-12345678";
+  await writeCandidate(
+    validateRoot,
+    { id: goodId, kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "good-name" },
+    renderCandidateBody("skill", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }], "good-name"),
+  );
+  // A malformed id (path-traversal-shaped), written directly rather than
+  // through writeCandidate (which would itself just slugify-sanitised
+  // input never produces this id in the first place; this stands in for
+  // a hand-edited or otherwise-untrusted file on disk).
+  await fs.writeFile(
+    path.join(validateRoot, "..bad.md"),
+    "---\nid: ../../etc/passwd\nkind: skill\nstatus: proposed\nmembers: []\nsuggested_name: x\n---\n\nbody\n",
+    "utf8",
+  );
+  // Filename does not match its own id.
+  await writeCandidate(
+    validateRoot,
+    { id: "mismatched-id", kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "mismatched" },
+    "body",
+  );
+  await fs.rename(path.join(validateRoot, "mismatched-id.md"), path.join(validateRoot, "renamed-after-write.md"));
+  // Malformed suggested_name.
+  await writeCandidate(
+    validateRoot,
+    { id: "bad-suggested-name", kind: "skill", status: "proposed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "../../escape" },
+    "body",
+  );
+
+  const loaded = await loadCandidates(validateRoot);
+  assert.deepEqual(loaded.map((c) => c.fields.id), [goodId], "only the well-formed candidate is loaded; the malformed-id, filename-mismatched, and malformed-suggested_name files are all skipped");
+}
+
+// ---------------------------------------------------------------------------
+// 18b. lib/maintain.js's evolveStep (P3): re-reads a candidate from disk
+//      right before patching its `members`, rather than trusting the
+//      snapshot taken at the top of the run, so a concurrent status
+//      change (e.g. a /evolve-archive that ran in between) is never
+//      silently overwritten or resurrected.
+// ---------------------------------------------------------------------------
+{
+  const raceRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "evolve-race-"));
+  const raceProject = { project_dir: raceRoot, root: raceRoot, id: "race-proj", instincts_personal: path.join(raceRoot, "instincts", "personal"), evolved_dir: path.join(raceRoot, "evolved") };
+  await fs.mkdir(raceProject.instincts_personal, { recursive: true });
+
+  for (let i = 0; i < 3; i++) {
+    await writeInstinct(
+      raceProject.instincts_personal,
+      { id: `race-habit-${i}`, trigger: `always run the race suite before merging pull request ${i}`, confidence: 0.6, domain: "racing", summary: `Run the race suite ${i}.`, created: new Date().toISOString() },
+      `# Race ${i}\n`,
+    );
+  }
+  await evolveStep(raceProject, { log: () => {} });
+  const [proposedRace] = await loadCandidates(raceProject.evolved_dir);
+  assert.equal(proposedRace.fields.status, "proposed");
+
+  // Simulates a concurrent /evolve-archive finishing between evolveStep's
+  // own snapshot and the member-update write: archive the candidate by
+  // hand, then grow the cluster by one member and re-run evolveStep.
+  await writeCandidate(raceProject.evolved_dir, { ...proposedRace.fields, status: "archived", reason: "concurrent archive" }, proposedRace.body);
+  await writeInstinct(
+    raceProject.instincts_personal,
+    { id: "race-habit-3", trigger: "always run the race suite before merging pull request 3", confidence: 0.6, domain: "racing", summary: "Run the race suite 3.", created: new Date().toISOString() },
+    "# Race 3\n",
+  );
+
+  const raceLog = [];
+  await evolveStep(raceProject, { log: (line) => raceLog.push(line) });
+  const afterRace = await findCandidateById(raceProject.evolved_dir, proposedRace.fields.id);
+  assert.equal(afterRace.fields.status, "archived", "a concurrently archived candidate is never resurrected by a later member update");
+  assert.equal(afterRace.fields.members.length, 3, "its members list is untouched (never patched onto a status that already moved on)");
+  assert.ok(raceLog.some((line) => line.includes("evolve: skipped cluster") && line.includes("previously archived")), "the archived-blocks-reproposal path, not the update path, is what actually ran here");
+}
+
+// ---------------------------------------------------------------------------
+// 18c. lib/candidates.js's resolveEvolveTargets (P3): a relative
+//      `evolve.targets.*` value (even after `~` expansion) is rejected
+//      with a warning naming which target, and the real default
+//      location is used instead rather than resolving against some
+//      arbitrary cwd.
+// ---------------------------------------------------------------------------
+{
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  let targets;
+  try {
+    targets = resolveEvolveTargets({ evolve: { targets: { skill: "relative/skills", command: "~/also/relative/../../etc", agent: "/already/absolute/agents", rule: "~/relative-after-tilde" } } });
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.ok(targets.skillDir.endsWith(`${path.sep}.config${path.sep}opencode${path.sep}skills`), "a relative skill target falls back to the real default");
+  assert.equal(targets.agentDir, "/already/absolute/agents", "an already-absolute target is used as given");
+  assert.ok(warnings.some((line) => line.includes("evolve.targets.skill") && line.includes("absolute")));
+  // `~/also/relative/../../etc` expands to an absolute path (home is
+  // absolute, `~/` always resolves to one), so it is accepted, not
+  // warned about; only a value that stays relative after expansion is.
+  assert.ok(path.isAbsolute(targets.commandDir));
+}
+
+// ---------------------------------------------------------------------------
+// 19. lib/maintain.js's pruneCandidatesStep: an installed candidate with
+//     zero uses in `prune.unusedDays` days is flagged (report-only,
+//     nothing touched) by default, and only archived + its installed
+//     file removed once `prune.auto` is explicitly on; a rule candidate
+//     is never flagged at all (no runtime usage signal to judge it by),
+//     and a candidate installed too recently to judge yet is left alone
+//     either way. Also covers the P2/P3 hardening: a failure uninstalling
+//     one candidate (lib/candidates.js's uninstallCandidateArtifact
+//     throwing) is logged and skipped, never aborting the rest of the
+//     sweep, and auto mode refuses to touch a kind whose entire usage
+//     bucket is empty (a dead signal, not proof of disuse).
+// ---------------------------------------------------------------------------
+{
+  const pruneRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "prune-candidates-"));
+  const pruneHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "prune-home-"));
+  const pruneProject = { project_dir: pruneRoot, root: pruneRoot, id: "prune-proj", instincts_personal: path.join(pruneRoot, "instincts", "personal"), evolved_dir: path.join(pruneRoot, "evolved") };
+  const pruneTargets = { skill: path.join(pruneHome, "skills"), command: path.join(pruneHome, "commands"), agent: path.join(pruneHome, "agents"), rule: path.join(pruneHome, "AGENTS.md") };
+  const pruneOptions = { prune: { unusedDays: 30 } };
+  const longAgo = new Date(Date.now() - 40 * 86400000).toISOString();
+
+  async function installFixtureSkill(id, suggestedName) {
+    const cluster = [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }];
+    const body = renderCandidateBody("skill", "testing", cluster, suggestedName);
+    await writeCandidate(
+      pruneProject.evolved_dir,
+      { id, kind: "skill", status: "installed", created: longAgo, members: ["m1"], summary: "s", suggested_name: suggestedName, project_id: pruneProject.id, installed_at: longAgo },
+      body,
+    );
+    const installPath = path.join(pruneTargets.skill, suggestedName, "SKILL.md");
+    await fs.mkdir(path.dirname(installPath), { recursive: true });
+    await fs.writeFile(installPath, body.replace("---\n", `---\ngenerated_by: mighty-instincts\ncandidate_id: ${id}\nproject_id: ${pruneProject.id}\nmembers: [m1]\n`), "utf8");
+    return installPath;
+  }
+
+  await installFixtureSkill("unused-cand", "unused-skill");
+  const recentPath = await installFixtureSkill("recent-cand", "recent-skill");
+  await bumpUsage(pruneProject.project_dir, "skills", "recent-skill");
+  // A candidate installed too recently to have had a fair chance yet,
+  // even though it has never been used: never flagged either.
+  const tooNewFields = { id: "too-new-cand", kind: "skill", status: "installed", created: new Date().toISOString(), members: ["m1"], summary: "s", suggested_name: "too-new-skill", project_id: pruneProject.id, installed_at: new Date().toISOString() };
+  await writeCandidate(pruneProject.evolved_dir, tooNewFields, renderCandidateBody("skill", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }], "too-new-skill"));
+
+  // A candidate whose installed "file" is actually a directory: reading
+  // it to check ownership throws (EISDIR), simulating any real-world
+  // failure (permissions, a half-written file, anything) uninstalling
+  // one specific candidate.
+  const brokenInstallPath = path.join(pruneTargets.skill, "broken-skill", "SKILL.md");
+  await fs.mkdir(brokenInstallPath, { recursive: true });
+  await writeCandidate(
+    pruneProject.evolved_dir,
+    { id: "broken-cand", kind: "skill", status: "installed", created: longAgo, members: ["m1"], summary: "s", suggested_name: "broken-skill", project_id: pruneProject.id, installed_at: longAgo },
+    renderCandidateBody("skill", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }], "broken-skill"),
+  );
+
+  const flagLog = [];
+  const flagged = await pruneCandidatesStep(pruneProject, { ...pruneOptions, evolve: { targets: pruneTargets } }, { log: (line) => flagLog.push(line) });
+  assert.equal(flagged.flagged, 2, "the long-installed, never-recently-used candidates are flagged (unused-cand and broken-cand)");
+  assert.equal(flagged.archived, 0, "report-only by default: nothing is archived");
+  assert.ok(flagLog.some((line) => line.includes("prune: flagged unused candidate unused-cand")));
+  const stillInstalled = await findCandidateById(pruneProject.evolved_dir, "unused-cand");
+  assert.equal(stillInstalled.fields.status, "installed", "flagging alone never changes the candidate's status");
+  await fs.access(path.join(pruneTargets.skill, "unused-skill", "SKILL.md")); // still there
+
+  const autoLog = [];
+  const autoOptions = { prune: { unusedDays: 30, auto: true }, evolve: { targets: pruneTargets } };
+  const autoResult = await pruneCandidatesStep(pruneProject, autoOptions, { log: (line) => autoLog.push(line) });
+  assert.equal(autoResult.archived, 1, "exactly the one candidate whose uninstall actually succeeded is archived (broken-cand's failure never blocks it)");
+  const nowArchived = await findCandidateById(pruneProject.evolved_dir, "unused-cand");
+  assert.equal(nowArchived.fields.status, "archived");
+  assert.equal(nowArchived.fields.reason, "auto-pruned: unused");
+  await assert.rejects(fs.access(path.join(pruneTargets.skill, "unused-skill", "SKILL.md")), "prune.auto also removed the installed file");
+  await fs.access(recentPath); // the recently-used candidate's file is untouched
+  const recentStillInstalled = await findCandidateById(pruneProject.evolved_dir, "recent-cand");
+  assert.equal(recentStillInstalled.fields.status, "installed", "a candidate used within the window is never flagged or archived");
+  const tooNewStill = await findCandidateById(pruneProject.evolved_dir, "too-new-cand");
+  assert.equal(tooNewStill.fields.status, "installed", "a too-recently-installed candidate is never flagged or archived either");
+  assert.ok(autoLog.some((line) => line.includes("prune: auto-archived unused candidate unused-cand")));
+
+  // broken-cand's own failure is logged, but never thrown: the step
+  // (and the loop inside it) completed and returned normally despite it.
+  const brokenStill = await findCandidateById(pruneProject.evolved_dir, "broken-cand");
+  assert.equal(brokenStill.fields.status, "installed", "a candidate whose uninstall threw is left exactly as it was, to retry next sweep");
+  assert.ok(autoLog.some((line) => line.includes("prune: failed to auto-archive broken-cand")), "the per-candidate failure is logged by name");
+}
+
+// ---------------------------------------------------------------------------
+// 19a. pruneCandidatesStep's auto mode refuses to touch an entire kind
+//      whose usage bucket is completely empty: that almost certainly
+//      means the usage *signal* for that kind is dead (a host naming its
+//      skill tool, or its input field, differently than lib/observe.js
+//      expects), not that every installed candidate of that kind is
+//      genuinely unused. Flagging (report-only) still happens either way.
+// ---------------------------------------------------------------------------
+{
+  const deadRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "prune-dead-signal-"));
+  const deadHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "prune-dead-home-"));
+  const deadProject = { project_dir: deadRoot, root: deadRoot, id: "dead-proj", instincts_personal: path.join(deadRoot, "instincts", "personal"), evolved_dir: path.join(deadRoot, "evolved") };
+  const deadTargets = { skill: path.join(deadHome, "skills"), command: path.join(deadHome, "commands"), agent: path.join(deadHome, "agents"), rule: path.join(deadHome, "AGENTS.md") };
+  const longAgo = new Date(Date.now() - 40 * 86400000).toISOString();
+
+  const cluster = [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }];
+  const body = renderCandidateBody("skill", "testing", cluster, "dead-signal-skill");
+  await writeCandidate(
+    deadProject.evolved_dir,
+    { id: "dead-signal-cand", kind: "skill", status: "installed", created: longAgo, members: ["m1"], summary: "s", suggested_name: "dead-signal-skill", project_id: deadProject.id, installed_at: longAgo },
+    body,
+  );
+  const deadInstallPath = path.join(deadTargets.skill, "dead-signal-skill", "SKILL.md");
+  await fs.mkdir(path.dirname(deadInstallPath), { recursive: true });
+  await fs.writeFile(deadInstallPath, body.replace("---\n", `---\ngenerated_by: mighty-instincts\ncandidate_id: dead-signal-cand\nproject_id: ${deadProject.id}\nmembers: [m1]\n`), "utf8");
+  // usage.json is never written at all for this project: the `skills`
+  // bucket is entirely empty, not merely missing this one candidate.
+
+  const autoLog = [];
+  const autoResult = await pruneCandidatesStep(deadProject, { prune: { unusedDays: 30, auto: true }, evolve: { targets: deadTargets } }, { log: (line) => autoLog.push(line) });
+  assert.equal(autoResult.flagged, 1, "still flagged (report-only detection does not depend on the signal being trustworthy)");
+  assert.equal(autoResult.archived, 0, "auto mode never archives a candidate of a kind whose usage bucket is entirely empty");
+  assert.ok(autoLog.some((line) => line.includes("skipped auto-archiving dead-signal-cand") && line.includes("usage bucket is entirely empty")));
+  const stillInstalled = await findCandidateById(deadProject.evolved_dir, "dead-signal-cand");
+  assert.equal(stillInstalled.fields.status, "installed");
+  await fs.access(deadInstallPath); // never removed
 }
 
 function buildFakeObserverOutput() {
