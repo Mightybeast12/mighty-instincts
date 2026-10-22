@@ -2,7 +2,7 @@
 
 An [OpenCode](https://opencode.ai) V2 plugin that observes session activity (tool calls and prompts) into a per-project log, periodically has a cheap model distil that log into small learned "instincts," and exposes [ECC](https://github.com/affaan-m/ECC)'s instinct CLI as slash commands. Nothing becomes live automatically on the write side: `/evolve` only writes inert markdown, and the observer is off by default. On the read side, the plugin adds a small `<instincts>` system-context block to every outgoing model request by default (`inject.enabled: true`); this costs no model call of its own, since it only reads instinct files this plugin (or `/instinct-import`) already wrote. A background maintenance loop (promote, prune, decay, dedupe, evolve) keeps those files tidy without any input from you.
 
-On the OpenCode 2 TUI it also adds a small, collapsible sidebar board summarising three sources of the user's own observation/improvement tooling, in plain language: **Learned habits** (this plugin's own instincts and observer status), **Skill notes** (the task-observer skill's open/parked backlog), and **Skill test** (skill-creator's latest benchmark result). Hosts without the sidebar can run `/board` for the same summary as plain text.
+On the OpenCode 2 TUI it also adds a small, collapsible sidebar board summarising three sources of the user's own observation/improvement tooling, in plain language: **Learned habits** (this plugin's own instincts and observer status), **Skill notes** (the task-observer skill's open/parked backlog), and **Skill test** (skill-creator's latest benchmark result). Hosts without the sidebar can run `/board` for a short, explanatory chat summary of the same three sources instead.
 
 ## Install
 
@@ -106,16 +106,16 @@ All options are optional; defaults shown:
 | `board.compact` | Start every board block collapsed to its title line only; still expandable by clicking. Does not affect the panel header. |
 | `board.refreshSeconds` | How often the board state file is recomputed on a timer (it is also refreshed on plugin setup and after every observer run). |
 | `board.observationsRoot` | Absolute path (or one starting with `~/`) to the task-observer skill's data directory. Defaults to `~/.local/share/opencode/task-observer`. |
-| `board.evalRoots` | Array of absolute paths (or ones starting with `~/`) to search for skill-creator benchmark output. Defaults to `["~/.config/opencode/skills", "$TMPDIR/opencode"]`. |
+| `board.evalRoots` | Array of absolute paths (or ones starting with `~/`) to search for skill-creator benchmark output, in priority order: the first root with any benchmark.json at all wins outright (its own newest file), and only a root beyond the first has smoke-test/fixture-looking paths filtered out before that. Defaults to `["~/.config/opencode/skills", "$TMPDIR/opencode"]`. |
 
 ## The board
 
 The board is a small, read-only summary of three sources, written by the server half of the plugin to a per-project `board-state.json` file and polled every 30 seconds (or refreshed on request) by the TUI sidebar panel and by `/board`. Every block has a status circle: a solid green `●` means active and healthy, a solid amber `●` means it needs attention, and a hollow `○` means stale or no data yet. In the sidebar, the panel header and every block title are clickable (collapsing the whole panel, or just that block, down to one line); whichever state you leave them in is remembered across restarts. The header also shows the installed version. Fully expanded, the panel reads something like:
 
 ```
-▾ Mighty Instincts v0.7.0
+▾ Mighty Instincts v0.7.1
   ▾ Learned habits               ● 16
-      added to prompts today          5
+      habits in prompts               6
       used by the agent today         2
       ready to share globally         4
         run /promote to share them
@@ -130,7 +130,7 @@ The board is a small, read-only summary of three sources, written by the server 
   ● active  ● needs attention  ○ stale
 ```
 
-(`/board`'s plain-text version lines the same labels and values up with dots instead of spaces, since it has no layout engine to delegate to: `Learned habits ............... ● 16`. The sidebar's own right edge follows the panel's actual rendered width, which the fixed-width preview above only approximates.)
+`/board` does not reproduce this layout: it replies in the chat as a short, explanatory summary instead (one headline line per block, then a sentence or two of plain-language context, e.g. what today's most-used habits were and why "used" is counted the way it is), since a table of dot-aligned rows reads awkwardly copied into a chat message. Both read from the exact same `board-state.json` and the same glyph/availability rules (`lib/board-text.js`), so the two are never out of step on what a given state actually means; they just say it differently.
 
 ### Glossary
 
@@ -138,10 +138,10 @@ The board intentionally avoids ECC's own vocabulary ("promote," "prune," "evolve
 
 | Row | Meaning |
 | --- | --- |
-| **added to prompts today** | How many times an instinct was included in a request today (`inject.enabled`). |
+| **habits in prompts** | How many instincts qualify for injection right now (confidence >= `inject.minConfidence`, not excluded, not pending). A live eligibility count, not a per-day tally; it can go up or down between refreshes as instincts are learned, decayed, or promoted. |
 | **used by the agent today** | How many times an included (or still-unproven, pending) instinct's trigger actually matched something you typed today. |
 | **ready to share globally** | Project instincts confident enough (>= 80%) to promote to the shared global bucket, that are not already there. `/promote` does this by hand; the maintenance loop also does it automatically once an instinct is seen in 2+ projects. |
-| **next learning run** | When the background observer is next allowed to run, given `observer.runIntervalMinutes`. |
+| **next learning run** | When the background observer is next allowed to run: `ready` once both `observer.runIntervalMinutes` has elapsed since the last run *and* `observer.minObservations` has piled up since, otherwise a countdown while only the interval is still outstanding. Shown as neither when the interval has already elapsed but there just has not been enough new activity yet (there is no fixed time to count down to in that case). |
 | **skill candidates** | How many deterministic, no-model-call skill outlines the maintenance loop's `evolve` step has written under `evolved/`, grouping related instincts; see "see `<path>`" to find them. |
 | **awaiting first use** | Instincts the observer was not confident enough about to call "learned" yet (the "50% rule," below); they graduate to real instincts once you actually use them once. |
 | **kept tidy** | What the maintenance loop did in the last 7 days: `promoted`, `archived`, `merged`, `pruned`, `candidates` (evolved outlines written), whichever of those are nonzero. |
@@ -172,6 +172,7 @@ ${CLV2_HOMUNCULUS_DIR or $XDG_DATA_HOME/ecc-homunculus or ~/.local/share/ecc-hom
     ├── maintenance.log             # plugin addition: one line per maintenance event
     ├── .observer-state.json        # plugin addition: last run time + line count for the gate
     ├── .activity.json              # plugin addition: last-observed/applied/fired-today counters
+    ├── fired-misses.log            # plugin addition: near-miss (1-2 shared word) fired-match log, capped at 200 lines
     ├── board-state.json            # plugin addition: the board's three-block summary
     ├── evolved/<cluster-id>.md     # plugin addition: deterministic candidate-skill outlines
     └── instincts/
@@ -192,14 +193,14 @@ Project identity (the `<project-hash>` above, or the shared `global` bucket when
 | `/instinct-status` | Show instinct status (project-scoped + global). |
 | `/instinct-import <file\|url> [--dry-run] [--min-confidence N] [--scope project\|global]` | Import instincts from a local file or an `https://` URL. |
 | `/instinct-export [--output file] [--domain d] [--min-confidence N] [--scope project\|global\|all]` | Export instincts to stdout or a file. |
-| `/evolve [--generate] [--limit N]` | Cluster instincts into skill/command/agent candidates; `--generate` writes them under `evolved/`. (Separate from the maintenance loop's own, always-on `evolve` step below, which writes a simpler, deterministic candidate outline without needing `--generate`.) |
+| `/evolve [--generate] [--limit N]` | Without `--generate`: a deterministic preview (no model call, no `instinct-cli.py`) of the top instinct clusters (member ids, average confidence, a "why" naming the words they share, a suggested form sized by cluster: rule < command < skill), ending with a hint to add `--generate`. With `--generate`: delegates to `instinct-cli.py`'s own evolve implementation, which writes skill/command/agent candidates under `evolved/`. (Separate from the maintenance loop's own, always-on `evolve` step below, which writes a simpler, deterministic candidate outline without needing `--generate`.) |
 | `/promote [id] [--dry-run]` | Promote a specific instinct, or auto-promote everything that qualifies, to global scope. |
 | `/instinct-projects` | List known projects and their instinct counts. |
 | `/instinct-prune [--dry-run] [--max-age N]` | Delete pending instincts older than the TTL. |
 | `/instinct-observe` | Run the observer right now, ignoring the enabled/interval/threshold gates. |
-| `/board` | Show the board summary as plain text (Learned habits, Skill notes, Skill test). |
+| `/board` | Show the board as a short, explanatory chat summary (Learned habits, Skill notes, Skill test); see "The board" above. |
 
-Every command above runs `instinct-cli.py` directly and posts its output back into the session as a synthetic message (`resume: false`); none of them start a model turn. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
+Every command above posts its reply back into the session as a synthetic message with `resume: true`, so it surfaces immediately instead of waiting for the next turn (you just typed the command, so you are sitting right there for the reply); none of them start a model turn. The background observer's own notify message (after an unprompted run nobody is necessarily watching for) keeps `resume: false` instead. `/instinct-import` and `/promote` pass `--force`, since typing the command is the confirmation that would otherwise come from the CLI's own `y/N` prompt.
 
 ## The `instincts` tool
 
@@ -233,7 +234,7 @@ This runs on `ctx.session.hook("context", ...)`, not `"prompt"`: it only ever ap
 
 Each line's summary is the instinct's own `summary:` frontmatter field (one imperative sentence, at most 120 characters); for an instinct written before 0.7.0 with no `summary:` of its own, it falls back to the first sentence of the `## Action` section, clipped to 120 characters.
 
-Each successful injection is counted in `.activity.json` (`appliedToday`, reset at UTC midnight) and shown on the board as "added to prompts today." When an included instinct's `trigger` shares at least 3 significant words (5+ letters, case-insensitive, common filler words removed) with the latest user message, that instinct's `fired` count (in its own frontmatter) is incremented, and the day's total is shown on the board as "used by the agent today." A pending instinct (the "50% rule," above) is checked for firing exactly the same way, but is never included in the injected block itself; once it fires, the maintenance loop promotes it to a real instinct. The observer never sees the injected block itself: `lib/observe.js` still strips any legacy `<instincts>...</instincts>` block it finds in prompt text (harmless now that injection no longer writes into prompt text at all, kept for defence against a residual block from before 0.7.0).
+Each successful injection is counted in `.activity.json` (`appliedToday`, reset at UTC midnight), tracked for its own sake rather than shown on the board directly: the board's "habits in prompts" row is a live eligibility count (how many instincts qualify right now), not this per-day tally. When an included instinct's `trigger` shares at least 3 significant words (5+ letters, case-insensitive, common filler words removed) with the latest user message, that instinct's `fired` count (in its own frontmatter) is incremented, and the day's total is shown on the board as "used by the agent today." A pending instinct (the "50% rule," above) is checked for firing exactly the same way, but is never included in the injected block itself; once it fires, the maintenance loop promotes it to a real instinct. A candidate that shares 1 or 2 significant words (just under the 3-word threshold, so it never actually fires) is logged instead to `fired-misses.log` (id, shared-word count, the words themselves; capped at 200 lines), for tuning that threshold later; nothing in this plugin ever reads that log back. The observer never sees the injected block itself: `lib/observe.js` still strips any legacy `<instincts>...</instincts>` block it finds in prompt text (harmless now that injection no longer writes into prompt text at all, kept for defence against a residual block from before 0.7.0).
 
 ## Maintenance
 

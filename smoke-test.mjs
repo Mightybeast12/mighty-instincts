@@ -321,11 +321,28 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await statusCommand.execute({ sessionID: "cmd-session", prompt: { text: "" } });
   const statusReply = harness.syntheticCalls.find((call) => call.sessionID === "cmd-session");
   assert.ok(statusReply, "instinct-status posted a synthetic reply");
-  assert.equal(statusReply.resume, false, "synthetic reply never resumes the agent");
+  assert.equal(statusReply.resume, true, "a typed command's reply resumes immediately instead of waiting for the next turn");
   assert.equal(statusReply.delivery, "queue");
   assert.equal(statusReply.description, PKG_NAME);
   assert.ok(statusReply.text.includes("No instincts found"), "status reflects the empty instinct store");
   assert.equal(harness.promptCalls.length, 0, "ctx.session.prompt is never called");
+
+  // /evolve without --generate previews lib/evolve-preview.js's own
+  // deterministic clusters and never shells out to instinct-cli.py at
+  // all (an empty project has nothing to cluster, so it reads as "no
+  // clusters yet"); only --generate still delegates to the real CLI.
+  const evolveCommand = harness.commandDefs.find((def) => def.name === "evolve");
+  await evolveCommand.execute({ sessionID: "cmd-session", prompt: { text: "" } });
+  const evolvePreviewReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
+  assert.ok(evolvePreviewReply.text.includes("No instinct clusters found yet"), "the no-flag preview path runs lib/evolve-preview.js, not instinct-cli.py");
+  assert.equal(evolvePreviewReply.resume, true, "the evolve preview still posts as a resumed, direct reply, same as every other command");
+
+  await evolveCommand.execute({ sessionID: "cmd-session", prompt: { text: "--generate" } });
+  const evolveGenerateReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
+  assert.ok(
+    !evolveGenerateReply.text.includes("No instinct clusters found yet"),
+    "--generate still delegates to instinct-cli.py's own evolve output, not lib/evolve-preview.js's sentinel text",
+  );
 
   // The instincts tool itself only exposes the read-only subset and never
   // forwards --force, --generate, or --output. Every path returns a
@@ -805,7 +822,10 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     new Date(new Date(lastRunAt).getTime() + 10 * 60000).toISOString(),
     "next run eligible 10 minutes after lastRunAt",
   );
+  assert.equal(state.instincts.nextRunReady, false, "the interval gate alone (2 of 10 minutes elapsed) is not enough to be ready yet");
   assert.equal(state.instincts.readyToShare, 2, "0.9 and 0.85 both clear the 0.8 promote threshold and neither is in the (empty) global bucket");
+  assert.equal(state.instincts.habitsInPrompts, 2, "alpha (0.9) and beta (0.85) clear the default 0.8 inject.minConfidence; gamma (0.6) does not");
+  assert.deepEqual(state.instincts.firedTodayTop, [], "no .activity.json written in this fixture, so nothing fired today");
   assert.equal(state.instincts.newestId, "gamma-instinct", "gamma-instinct has the latest mtime (touched to 'now')");
   assert.ok(typeof state.instincts.newestAt === "string" && !Number.isNaN(Date.parse(state.instincts.newestAt)));
   assert.equal(state.instincts.runs, 3, "3 observer.log run lines");
@@ -859,6 +879,58 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const pointerPath = pointerFilePath(options, projectDir);
   const pointer = JSON.parse(await fs.readFile(pointerPath, "utf8"));
   assert.equal(pointer.boardStatePath, stateFile, "pointer file resolves to the real state file");
+}
+
+// ---------------------------------------------------------------------------
+// 6a. lib/board.js's nextRunReady/nextRunEligibleAt gate (observer.js's own
+//     thresholdsMet(): interval AND minObservations, not the interval
+//     alone): a long-idle lastRunAt (interval long since elapsed) used to
+//     leave nextRunEligibleAt reading as a stale, confusing duration once
+//     relativeTime (direction-free) formatted it; "ready" now covers the
+//     "both gates already pass" case explicitly, and no ETA is given at
+//     all once only the observation count is still outstanding (there is
+//     no future timestamp to compute that from).
+// ---------------------------------------------------------------------------
+{
+  const { refreshBoardState } = await import("./lib/board.js");
+
+  const { projectDir, dataDir } = makeProjectAndData("board-ready");
+  const options = { python: "python3", dataDir, observer: { enabled: true, runIntervalMinutes: 5, minObservations: 10 }, board: { enabled: true } };
+  const ctx = { location: { directory: projectDir } };
+  const project = await resolveProject(ctx, options);
+
+  // lastRunAt a full day ago: the 5-minute interval gate is long since
+  // elapsed either way, so these two cases differ only in whether enough
+  // observations have piled up since.
+  const staleLastRunAt = new Date(Date.now() - 86400000).toISOString();
+  await fs.mkdir(project.project_dir, { recursive: true });
+  await fs.writeFile(path.join(project.project_dir, ".observer-state.json"), JSON.stringify({ lastRunAt: staleLastRunAt, lastLineCount: 0 }), "utf8");
+
+  // Case 1: 12 pending lines, minObservations 10: both gates pass, so the
+  // board reads "ready" instead of some stale duration.
+  await fs.writeFile(project.observations_file, Array.from({ length: 12 }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n", "utf8");
+  const readyState = await refreshBoardState(ctx, options);
+  assert.equal(readyState.instincts.nextRunReady, true, "interval elapsed and minObservations met: ready now");
+  assert.equal(readyState.instincts.nextRunEligibleAt, null, "no future ETA needed once already ready");
+
+  // Case 2: only 4 pending lines (minObservations still 10): the interval
+  // gate alone is not the whole story, and there is no future timestamp to
+  // predict when enough new activity will arrive, so neither "ready" nor
+  // an ETA is shown.
+  await fs.writeFile(project.observations_file, Array.from({ length: 4 }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n", "utf8");
+  const waitingState = await refreshBoardState(ctx, options);
+  assert.equal(waitingState.instincts.nextRunReady, false, "interval elapsed but minObservations not met: not ready");
+  assert.equal(waitingState.instincts.nextRunEligibleAt, null, "no ETA exists for 'waiting on more activity'; it is not a time-bound wait");
+
+  const { buildInstinctsBlock } = await import("./lib/board-text.js");
+  assert.ok(
+    buildInstinctsBlock(readyState.instincts).rows.some((row) => row.label === "next learning run" && row.value === "ready"),
+    "the sidebar/board block model shows 'ready' instead of a relativeTime duration",
+  );
+  assert.ok(
+    !buildInstinctsBlock(waitingState.instincts).rows.some((row) => row.label === "next learning run"),
+    "with no ETA and not ready, the row is omitted rather than showing a confusing value",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -920,11 +992,69 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
-// 7. /board summary text (lib/board-format.js) must never throw, including
-//    when the board has not been written yet or every block reports itself
-//    unavailable, and must use the same block labels/wording as the
-//    sidebar panel (lib/board-text.js), just as plain text with dot-filled
-//    alignment and a trailing legend row.
+// 6d. lib/board-evals.js's root priority and fixture filtering: the first
+//     configured root wins outright (its own newest file), even against a
+//     strictly newer benchmark.json under a later, smoke-test-fixture-
+//     looking root; only once the first root has nothing at all does a
+//     later root get searched, with fixture-looking paths skipped there.
+//     Mirrors the real bug this fixed: a live board's default roots are
+//     [~/.config/opencode/skills, $TMPDIR/opencode], and this very file's
+//     own fixtures (made under exactly the second one) were what a live
+//     board picked up instead of a real skill-creator run.
+// ---------------------------------------------------------------------------
+{
+  const { readEvalsSummary } = await import("./lib/board-evals.js");
+
+  const realRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "real-skills-"));
+  const realIterationDir = path.join(realRoot, "pr-workspace", "iteration-1");
+  await fs.mkdir(realIterationDir, { recursive: true });
+  const realTimestamp = new Date(Date.now() - 86400000).toISOString();
+  await fs.writeFile(
+    path.join(realIterationDir, "benchmark.json"),
+    JSON.stringify({
+      metadata: { skill_name: "real-pr-skill", timestamp: realTimestamp, evals_run: [1], runs_per_configuration: 1 },
+      run_summary: { without_skill: { pass_rate: { mean: 0.2 } }, with_skill: { pass_rate: { mean: 0.8 } } },
+    }),
+    "utf8",
+  );
+
+  // A smoke-test-fixture-looking root (an "eval-<id>" directory, exactly
+  // the shape smoke-test.mjs's own mkdtempSync calls create under the
+  // default temp root), holding a strictly newer benchmark.json than the
+  // real root above.
+  const fixtureRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "eval-"));
+  const fixtureIterationDir = path.join(fixtureRoot, "fixture-workspace", "iteration-1");
+  await fs.mkdir(fixtureIterationDir, { recursive: true });
+  await fs.writeFile(
+    path.join(fixtureIterationDir, "benchmark.json"),
+    JSON.stringify({
+      metadata: { skill_name: "no-runs-array", timestamp: new Date().toISOString(), evals_run: [1], runs_per_configuration: 1 },
+      run_summary: { without_skill: { pass_rate: { mean: 0.1 } }, with_skill: { pass_rate: { mean: 0.9 } } },
+    }),
+    "utf8",
+  );
+
+  const result = await readEvalsSummary([realRoot, fixtureRoot]);
+  assert.equal(result.skill, "real-pr-skill", "the first configured root's own benchmark wins outright, even though the second root's file is newer");
+  assert.equal(result.timestamp, realTimestamp);
+
+  // The same fixture-looking root is still read normally when it is the
+  // only (first) root configured: fixture filtering only ever applies to
+  // a root beyond the first, never to the one the caller explicitly
+  // pointed at.
+  const fixtureOnly = await readEvalsSummary([fixtureRoot]);
+  assert.equal(fixtureOnly.skill, "no-runs-array", "a fixture-looking root is still read when it is the only (first) root configured");
+}
+
+// ---------------------------------------------------------------------------
+// 7. /board summary text (lib/board-format.js): a brief, explanatory chat
+//    reply (one headline line per block, then plain-language sentences),
+//    not the sidebar's table-like rows. Must never throw, including when
+//    the board has not been written yet or every block reports itself
+//    unavailable, must read its facts through lib/board-text.js's own
+//    block builders (so it can never show a glyph/availability state the
+//    sidebar itself would disagree with), and must end with the same
+//    legend row the sidebar panel's own footer uses.
 // ---------------------------------------------------------------------------
 {
   const { formatBoardSummary } = await import("./lib/board-format.js");
@@ -956,6 +1086,54 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   const disabledSections = formatBoardSummary(everythingUnavailable, { board: { sections: { instincts: false, observations: false, evals: false } } });
   assert.equal(disabledSections, "No board sections enabled.", "every block can be hidden independently");
+
+  // A fuller, "everything available" state exercises the actual
+  // explanatory content: the top-3-habits-fired-today list, the
+  // "habits in prompts" eligibility figure (not a per-day count), the
+  // next-run phrasing, and the /promote hint.
+  const richState = {
+    updatedAt: new Date().toISOString(),
+    instincts: {
+      project: 10,
+      inherited: 4,
+      global: 2,
+      observerEnabled: true,
+      nextRunReady: true,
+      lastRun: new Date().toISOString(),
+      habitsInPrompts: 6,
+      readyToShare: 3,
+      firedTodayTop: [
+        { id: "grep-before-edit", count: 3, summary: "Search the repo before editing unfamiliar files." },
+        { id: "run-tests-first", count: 1, summary: "Run the test suite before pushing." },
+      ],
+    },
+    observations: { open: 398, parked: 12, lastReview: null, staged: 2, added7d: 158, available: true, warning: false },
+    evals: {
+      skill: "pr",
+      delta: 0.84,
+      withSkill: 0.92,
+      baseline: 0.08,
+      baselineKind: "without",
+      iteration: 2,
+      path: "/x/benchmark.json",
+      available: true,
+      timestamp: new Date(Date.now() - 2 * 86400000).toISOString(),
+    },
+  };
+  const richSummary = formatBoardSummary(richState, {});
+  assert.ok(richSummary.includes("16 total"), "the headline still carries project+inherited+global");
+  assert.ok(richSummary.includes("6 eligible for prompts right now"), "habitsInPrompts reads as a live eligibility count, not a per-day tally");
+  assert.ok(richSummary.includes("Top habits used today:"), "the top-3-fired-today list has its own intro line");
+  assert.ok(richSummary.includes("1. grep-before-edit (3x): Search the repo before editing unfamiliar files."), "each habit line carries its id, fired count, and clipped summary");
+  assert.ok(richSummary.includes("2. run-tests-first (1x): Run the test suite before pushing."));
+  assert.ok(richSummary.includes("Next learning run: ready."), "nextRunReady reads as 'ready', never a relativeTime duration");
+  assert.ok(richSummary.includes("3 are confident enough to promote globally: run /promote to share them."), "the /promote hint only appears once readyToShare is positive");
+  assert.ok(richSummary.includes("398 open, 158 added this week"), "Skill notes stays a single sentence");
+  assert.ok(richSummary.includes("92% with the skill vs 8% without"), "Skill test stays a single sentence");
+  assert.ok(!/[\u2014\u2013]/.test(richSummary), "/board text never contains an em or en dash");
+
+  const noHabitsToday = formatBoardSummary({ ...richState, instincts: { ...richState.instincts, firedTodayTop: [] } }, {});
+  assert.ok(noHabitsToday.includes("No habits fired today yet."), "an empty top-habits list reads as a plain sentence, not an empty list header");
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,13 +1211,24 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const withoutCandidates = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 0, skillCandidates: 0 });
   assert.ok(!withoutCandidates.rows.some((row) => row.label === "skill candidates"), "skillCandidates: 0 omits the row entirely");
 
-  // --- activity rows omitted at zero, shown when positive --------------
-  const noActivity = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), appliedToday: 0, firedToday: 0 });
-  assert.ok(!noActivity.rows.some((row) => row.label === "added to prompts today"));
-  assert.ok(!noActivity.rows.some((row) => row.label === "used by the agent today"));
-  const withActivity = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), appliedToday: 5, firedToday: 2 });
-  assert.ok(withActivity.rows.some((row) => row.label === "added to prompts today" && row.value === "5"));
-  assert.ok(withActivity.rows.some((row) => row.label === "used by the agent today" && row.value === "2"));
+  // --- "habits in prompts": a live eligibility count, shown even at 0
+  //     (unlike "used by the agent today", a per-day tally that still
+  //     hides at 0) -------------------------------------------------------
+  const noHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 0, firedToday: 0 });
+  assert.ok(noHabitsInPrompts.rows.some((row) => row.label === "habits in prompts" && row.value === "0"), "a zero (known) habitsInPrompts still renders its own row");
+  assert.ok(!noHabitsInPrompts.rows.some((row) => row.label === "used by the agent today"), "firedToday 0 still omits its own row");
+  const withHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 5, firedToday: 2 });
+  assert.ok(withHabitsInPrompts.rows.some((row) => row.label === "habits in prompts" && row.value === "5"));
+  assert.ok(withHabitsInPrompts.rows.some((row) => row.label === "used by the agent today" && row.value === "2"));
+  const noHabitsInPromptsField = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString() });
+  assert.ok(!noHabitsInPromptsField.rows.some((row) => row.label === "habits in prompts"), "habitsInPrompts missing entirely (e.g. an older board-state.json) omits the row rather than showing a bare 'null'");
+
+  // --- "next learning run": "ready" takes priority over a computed ETA,
+  //     since relativeTime has no "ago"/"in" direction of its own ------
+  const readyModel = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), nextRunReady: true, nextRunEligibleAt: null });
+  assert.ok(readyModel.rows.some((row) => row.label === "next learning run" && row.value === "ready"), "nextRunReady shows 'ready', not a duration");
+  const noEtaModel = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), nextRunReady: false, nextRunEligibleAt: null });
+  assert.ok(!noEtaModel.rows.some((row) => row.label === "next learning run"), "neither ready nor a known ETA: the row is omitted entirely");
 
   // --- "kept tidy" summary row: omitted when all-zero, joined otherwise
   const keptTidyEmpty = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0 } } });
@@ -1126,9 +1315,12 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 // 10. lib/activity.js: recordObserved always flushes on its first call for
 //     a project, then throttles to at most once per 10s; recordApplied's
 //     and recordFired's writes are never throttled and never clobber
-//     lastObservedAt or each other; readActivitySnapshot always reads
-//     straight from disk and is date-scoped (a stale appliedDate/firedDate
-//     reads as 0 "today").
+//     lastObservedAt or each other; recordFired also tracks a per-id
+//     breakdown (firedByIdToday) alongside the aggregate, for the /board
+//     chat summary's "top habits used today" list; readActivitySnapshot
+//     always reads straight from disk and is date-scoped (a stale
+//     appliedDate/firedDate reads as 0 "today", and firedByIdToday resets
+//     with it).
 // ---------------------------------------------------------------------------
 {
   const { recordObserved, recordApplied, recordFired, readActivitySnapshot } = await import("./lib/activity.js");
@@ -1140,6 +1332,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(before.lastObservedAt, null, "no .activity.json yet: lastObservedAt starts null");
   assert.equal(before.appliedToday, 0, "no .activity.json yet: appliedToday starts 0");
   assert.equal(before.firedToday, 0, "no .activity.json yet: firedToday starts 0");
+  assert.deepEqual(before.firedByIdToday, {}, "no .activity.json yet: firedByIdToday starts empty");
 
   await recordObserved(projectDir);
   const firstWrite = JSON.parse(await fs.readFile(path.join(projectDir, ".activity.json"), "utf8"));
@@ -1151,11 +1344,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   await recordApplied(projectDir, 2);
   await recordApplied(projectDir, 3);
-  await recordFired(projectDir);
-  await recordFired(projectDir, 2);
+  await recordFired(projectDir, "habit-a");
+  await recordFired(projectDir, "habit-b", 2);
+  await recordFired(projectDir, "habit-a"); // fires again: its own per-id count accumulates independently of habit-b's
   const afterApplied = await readActivitySnapshot(projectDir);
   assert.equal(afterApplied.appliedToday, 5, "recordApplied accumulates within the same day");
-  assert.equal(afterApplied.firedToday, 3, "recordFired accumulates within the same day, independently of appliedToday");
+  assert.equal(afterApplied.firedToday, 4, "recordFired's aggregate accumulates within the same day, independently of appliedToday");
+  assert.deepEqual(afterApplied.firedByIdToday, { "habit-a": 2, "habit-b": 2 }, "per-id fired-today counts accumulate alongside the aggregate");
   assert.ok(
     typeof afterApplied.lastObservedAt === "string" && !Number.isNaN(Date.parse(afterApplied.lastObservedAt)),
     "recordApplied/recordFired's writes never clobber lastObservedAt with null/undefined",
@@ -1163,18 +1358,22 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(Date.parse(afterApplied.lastObservedAt) >= Date.parse(firstWrite.lastObservedAt), "lastObservedAt never moves backwards");
 
   // A stale appliedDate/firedDate (e.g. from before midnight UTC) must
-  // read as 0 for "today" rather than passed through as-is.
+  // read as 0 for "today" rather than passed through as-is, and
+  // firedByIdToday must reset with it rather than leaking yesterday's ids.
   const activityPath = path.join(projectDir, ".activity.json");
   const stale = JSON.parse(await fs.readFile(activityPath, "utf8"));
   stale.appliedDate = "2000-01-01";
   stale.appliedToday = 99;
   stale.firedDate = "2000-01-01";
   stale.firedToday = 99;
+  stale.firedByIdToday = { "stale-habit": 99 };
   await fs.writeFile(activityPath, JSON.stringify(stale), "utf8");
   const afterStaleDate = await readActivitySnapshot(projectDir);
   assert.equal(afterStaleDate.appliedToday, 0, "appliedToday from a different (stale) date reads as 0 for today");
   assert.equal(afterStaleDate.firedToday, 0, "firedToday from a different (stale) date reads as 0 for today");
+  assert.deepEqual(afterStaleDate.firedByIdToday, {}, "firedByIdToday from a different (stale) date reads as empty for today");
 }
+
 
 // ---------------------------------------------------------------------------
 // 11. lib/inject.js pure functions: candidate selection (confidence
@@ -1420,6 +1619,187 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(unrelatedEvent.system.length, 1, "the instinct is still injected even when unrelated to the prompt");
   const contentAfterUnrelated = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
   assert.ok(/fired:\s*1/.test(contentAfterUnrelated), "fired stays at 1: an unrelated message never bumps it");
+}
+
+// ---------------------------------------------------------------------------
+// 13a. lib/inject.js's fired-miss logging (fired-misses.log, beside
+//      .activity.json): a candidate whose trigger shares exactly 1 or 2
+//      significant words with the latest message (just under
+//      MIN_SHARED_WORDS, so it never actually fires) is logged there with
+//      its id, the shared-word count, and the words themselves, for
+//      tuning the firing threshold later; a message sharing 0 words logs
+//      nothing (not "every near-zero candidate", only near misses), and
+//      the log stays capped at 200 lines (oldest dropped first).
+// ---------------------------------------------------------------------------
+{
+  const { registerInject } = await import("./lib/inject.js");
+
+  const { projectDir, dataDir } = makeProjectAndData("inject-miss");
+  const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+  const hooks = {};
+  const ctx = {
+    location: { directory: projectDir },
+    session: {
+      hook: async (name, cb) => {
+        hooks[name] = cb;
+        return { dispose: async () => {} };
+      },
+    },
+  };
+
+  const project = await resolveProject(ctx, options);
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+    "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+  );
+
+  await registerInject(ctx, options);
+
+  // Shares exactly 2 significant words with the trigger (unfamiliar,
+  // repository; "editing" is not in this message, "before" and "grep"
+  // are never significant at all): a near miss, just under
+  // MIN_SHARED_WORDS (3).
+  const nearMissEvent = contextEvent({ sessionID: "miss-s1", userText: "the unfamiliar repository needs cleanup" });
+  await hooks.context(nearMissEvent);
+
+  const missLogPath = path.join(project.project_dir, "fired-misses.log");
+  const missLogContent = await fs.readFile(missLogPath, "utf8");
+  const missLines = missLogContent.split("\n").filter((line) => line.trim().length > 0);
+  assert.equal(missLines.length, 1, "exactly one near miss logged");
+  assert.ok(missLines[0].includes("id=grep-before-edit"), "the log line names the candidate id");
+  assert.ok(missLines[0].includes("count=2"), "the log line carries the shared-word count");
+  assert.ok(missLines[0].includes("words=unfamiliar,repository"), "the log line names the actual shared words");
+
+  const instinctAfterNearMiss = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+  assert.ok(!/fired:/.test(instinctAfterNearMiss), "a near miss (below MIN_SHARED_WORDS) never bumps the instinct's own fired count");
+
+  // A message sharing 0 significant words with the trigger logs nothing
+  // at all: only near misses (1 or 2 shared words) are worth logging.
+  const noOverlapEvent = contextEvent({ sessionID: "miss-s1", userText: "please summarise the quarterly numbers" });
+  await hooks.context(noOverlapEvent);
+  const stillOneLine = (await fs.readFile(missLogPath, "utf8")).split("\n").filter((line) => line.trim().length > 0);
+  assert.equal(stillOneLine.length, 1, "a message with zero shared words never adds a line");
+
+  // The log stays capped at 200 lines: pre-seed it at exactly the cap,
+  // then one more near miss must push out the oldest line rather than
+  // growing past it.
+  const seeded = Array.from({ length: 200 }, (_, i) => `seed-line-${i}`).join("\n");
+  await fs.writeFile(missLogPath, `${seeded}\n`, "utf8");
+  await hooks.context(contextEvent({ sessionID: "miss-s1", userText: "the unfamiliar repository needs cleanup again" }));
+  const cappedLines = (await fs.readFile(missLogPath, "utf8")).split("\n").filter((line) => line.trim().length > 0);
+  assert.equal(cappedLines.length, 200, "the log never grows past 200 lines");
+  assert.ok(!cappedLines.includes("seed-line-0"), "the oldest line is dropped once the cap is exceeded");
+  assert.ok(cappedLines[cappedLines.length - 1].includes("id=grep-before-edit"), "the newest near miss is the last line");
+
+  // Two near misses in the very same request (bumpFiredForMatches runs
+  // its per-entry checks via Promise.all) must both land: the
+  // read-modify-write against fired-misses.log is serialized per project
+  // directory precisely so two near misses racing on the same file never
+  // let one overwrite the other.
+  await fs.writeFile(missLogPath, "", "utf8");
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "verify-coverage", trigger: "always verify coverage thresholds before merging pull request", confidence: 0.9, domain: "testing" },
+    "# Verify Coverage\n\n## Action\nVerify coverage thresholds before merging.\n",
+  );
+  // Shares exactly 2 words with grep-before-edit's trigger (unfamiliar,
+  // repository) and exactly 1 with verify-coverage's (coverage): both
+  // near misses, triggered from the same context-hook call.
+  await hooks.context(contextEvent({ sessionID: "miss-s1", userText: "the unfamiliar repository also needs extra coverage review" }));
+  const concurrentLines = (await fs.readFile(missLogPath, "utf8")).split("\n").filter((line) => line.trim().length > 0);
+  assert.equal(concurrentLines.length, 2, "both near misses from the same request are logged, neither lost to a write race");
+  assert.ok(concurrentLines.some((line) => line.includes("id=grep-before-edit") && line.includes("count=2")));
+  assert.ok(concurrentLines.some((line) => line.includes("id=verify-coverage") && line.includes("count=1")));
+}
+
+// ---------------------------------------------------------------------------
+// 13b. lib/evolve-preview.js: buildEvolveClusters groups personal
+//      instincts the same way lib/maintain.js's evolveStep does (domain,
+//      then significant-word overlap), and additionally computes each
+//      cluster's average confidence, a deterministic "why" (the words
+//      every member's own text actually shares), and a size-based
+//      suggested form (rule < command < skill); formatEvolvePreview then
+//      renders the top N (0 = no cap), always ending with the --generate
+//      hint, and reads as "no clusters yet" when none qualify.
+// ---------------------------------------------------------------------------
+{
+  const { buildEvolveClusters, formatEvolvePreview } = await import("./lib/evolve-preview.js");
+
+  const evolvePreviewRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "evolve-preview-"));
+  const evolvePreviewProject = {
+    project_dir: evolvePreviewRoot,
+    instincts_personal: path.join(evolvePreviewRoot, "instincts", "personal"),
+    evolved_dir: path.join(evolvePreviewRoot, "evolved"),
+  };
+  await fs.mkdir(evolvePreviewProject.instincts_personal, { recursive: true });
+
+  // 5-member "workflow" cluster: every trigger shares the same
+  // significant words (only the trailing index digit differs, and digits
+  // alone never clear MIN_WORD_LEN), so clusterItems groups all 5
+  // together. 5 members sits above the "rule" cutoff and at or below the
+  // "command" cutoff, so it should suggest "command".
+  for (let i = 0; i < 5; i++) {
+    await writeInstinct(
+      evolvePreviewProject.instincts_personal,
+      {
+        id: `workflow-habit-${i}`,
+        trigger: `always check the shared repository configuration before merging branch ${i}`,
+        confidence: 0.6 + i * 0.05, // 0.6, 0.65, 0.7, 0.75, 0.8: average 0.7
+        domain: "workflow",
+        summary: `Check the shared repository configuration ${i}.`,
+        created: new Date().toISOString(),
+      },
+      `# Workflow ${i}\n`,
+    );
+  }
+
+  // 3-member "testing" cluster: at or below the "rule" cutoff, so it
+  // should suggest "rule" instead.
+  for (let i = 0; i < 3; i++) {
+    await writeInstinct(
+      evolvePreviewProject.instincts_personal,
+      {
+        id: `testing-habit-${i}`,
+        trigger: `always verify coverage thresholds before merging pull request ${i}`,
+        confidence: 0.9,
+        domain: "testing",
+        summary: `Verify coverage thresholds ${i}.`,
+        created: new Date().toISOString(),
+      },
+      `# Testing ${i}\n`,
+    );
+  }
+
+  const clusters = await buildEvolveClusters(evolvePreviewProject);
+  assert.equal(clusters.length, 2, "two domains, each forming exactly one qualifying cluster");
+
+  assert.equal(clusters[0].domain, "workflow", "the bigger cluster (5 members) sorts first");
+  assert.equal(clusters[0].size, 5);
+  assert.deepEqual(clusters[0].memberIds, ["workflow-habit-0", "workflow-habit-1", "workflow-habit-2", "workflow-habit-3", "workflow-habit-4"]);
+  assert.equal(clusters[0].avgConfidence, 0.7, "average of 0.6/0.65/0.7/0.75/0.8");
+  assert.equal(clusters[0].form, "command", "5 members: above the rule cutoff, at or below the command cutoff");
+  assert.equal(clusters[0].why, "always, branch, check, configuration", "top 4 words every member shares, alphabetical among ties");
+
+  assert.equal(clusters[1].domain, "testing");
+  assert.equal(clusters[1].size, 3);
+  assert.equal(clusters[1].form, "rule", "3 members: at or below the rule cutoff");
+  assert.equal(clusters[1].why, "always, coverage, merging, request");
+
+  const limited = formatEvolvePreview(clusters, { limit: 1 });
+  assert.ok(limited.startsWith("1 of 2 cluster(s) found:"), "the header's own total still counts every qualifying cluster, even when limit trims the list shown");
+  assert.ok(!limited.includes("testing-habit-0"), "the second cluster's members are not shown when limit=1");
+  assert.ok(limited.endsWith("Run /evolve --generate to write these as candidate structures under evolved/."), "the preview always ends with the --generate hint");
+
+  const unlimited = formatEvolvePreview(clusters, { limit: 0 });
+  assert.ok(unlimited.includes("workflow-habit-0") && unlimited.includes("testing-habit-0"), "limit 0 shows every qualifying cluster");
+
+  const defaulted = formatEvolvePreview(clusters);
+  assert.ok(defaulted.startsWith("2 of 2 cluster(s) found:"), "with only 2 qualifying clusters, the default limit (3) shows both");
+
+  const empty = formatEvolvePreview([], {});
+  assert.ok(empty.includes("No instinct clusters found yet"), "no qualifying clusters at all reads as a plain 'nothing yet' message");
+  assert.ok(!/[\u2014\u2013]/.test(empty) && !/[\u2014\u2013]/.test(unlimited), "the evolve preview text never contains an em or en dash");
 }
 
 // ---------------------------------------------------------------------------

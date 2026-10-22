@@ -56,10 +56,17 @@ const GLYPH_COLLAPSED = "\u25b8"; // ▸
 // spinner frames idea"): a slow breathe, not a spinner direction, since
 // this means "recently active", not "in progress". Replaces the block's
 // usual status circle while an observation landed in the last
-// PULSE_WINDOW_MS, exactly as it did for the old "Instincts" title.
+// PULSE_WINDOW_MS, exactly as it did for the old "Instincts" title. Drawn
+// in the block's own state colour (glyphColor(model.glyph, colors) in
+// block() below), not a colour of its own, so a pulsing title still reads
+// as "active"/"attention"/"stale" at a glance; only the glyph shape
+// (breathing dot vs. the plain state circle) marks "recently active" on
+// top of that. 10s, not 60s: a 60s window stayed lit long past the last
+// observation, freezing on PULSE_FRAMES' own "•" frame between ticks
+// rather than ever settling back to the real state circle.
 const PULSE_FRAMES = ["\u00b7", "\u2022", "\u25cf", "\u2022"]; // · • ● •
 const PULSE_MS = 500;
-const PULSE_WINDOW_MS = 60000;
+const PULSE_WINDOW_MS = 10000;
 
 const FALLBACK = {
   text: "#e5e7eb",
@@ -244,8 +251,13 @@ function glyphColor(glyph, colors) {
 // nearest equivalent to a tooltip, since the TUI has no hover).
 function block({ key, model, interaction, colors, pulseGlyph = null }) {
   const expanded = interaction.isBlockOpen(key);
+  // The glyph *shape* is the only thing the pulse overrides: a breathing
+  // frame while recently active, the plain state circle otherwise. Its
+  // *colour* always comes from the block's real state (glyphColor below),
+  // never forced to success, so a pulsing "attention" block still reads
+  // amber rather than masquerading as green while it breathes.
   const glyphChar = pulseGlyph ?? GLYPH_CHAR[model.glyph] ?? GLYPH_CHAR.stale;
-  const glyphClr = pulseGlyph ? colors.success : glyphColor(model.glyph, colors);
+  const glyphClr = glyphColor(model.glyph, colors);
   const title = clickableRow(() => interaction.toggleBlock(key), [
     glyphText(expanded, colors),
     text({ fg: colors.text, wrapMode: "none", truncate: true, flexGrow: 1, flexShrink: 1 }, [model.label]),
