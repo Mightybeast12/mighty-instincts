@@ -149,7 +149,7 @@ The board is a small, read-only summary of three sources, written by the server 
 
 ```
 ● Learned habits   29 total, 10 in prompts, 3 used today (14 this week)
-  Habits are patterns learned from your activity; one counts as used when its trigger matches something you typed.
+  Habits are patterns learned from your activity; one counts as used once per prompt you type in a top-level session whose wording shares 3 or more significant words with the habit's trigger; subagent and background sessions are not counted.
   Used today: absolute-node-path-when-shell-lacks-node (1x): Use the absolute Homebrew node path for all node calls.
               fff-grep-anchor-fallback-to-read (1x): Read the named file directly with a windowed Read.
   Next learning run after 14 more events (6 so far). 10 ready: /promote.

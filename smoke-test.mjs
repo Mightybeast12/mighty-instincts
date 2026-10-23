@@ -2144,6 +2144,161 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
+// 13c. lib/inject.js's per-turn dedupe and child-session skip (both fix
+//      inflated `fired` counts): the "context" hook fires once per
+//      request, so the same latest user message repeated across several
+//      requests in one turn (tool-call steps) must only bump `fired`
+//      once; a different latest user message bumps it again; a child
+//      session (session.get resolves a parentID) is still injected into
+//      but never bumps `fired`; and a session.get that throws is treated
+//      as top-level (fired still bumps) rather than silently suppressed.
+// ---------------------------------------------------------------------------
+{
+  const { registerInject } = await import("./lib/inject.js");
+
+  function makeInjectHarness(projectDir, sessionGet) {
+    const hooks = {};
+    const ctx = {
+      location: { directory: projectDir },
+      session: {
+        hook: async (name, cb) => {
+          hooks[name] = cb;
+          return { dispose: async () => {} };
+        },
+        ...(sessionGet ? { get: sessionGet } : {}),
+      },
+    };
+    return { ctx, hooks };
+  }
+
+  // --- same sessionID, same latest user text, twice: fired bumps once ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("inject-dedupe-same");
+    const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+    const { ctx, hooks } = makeInjectHarness(projectDir);
+
+    const project = await resolveProject(ctx, options);
+    await writeInstinct(
+      project.instincts_personal,
+      { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+      "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+    );
+
+    await registerInject(ctx, options);
+    const text = "please grep this unfamiliar repository before editing anything";
+
+    await hooks.context(contextEvent({ sessionID: "turn-s1", userText: text }));
+    await hooks.context(contextEvent({ sessionID: "turn-s1", userText: text }));
+
+    const content = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+    assert.ok(/fired:\s*1/.test(content), "two requests carrying the same latest user message (simulating tool-call steps within one turn) bump fired exactly once, not twice");
+
+    const activity = JSON.parse(await fs.readFile(path.join(project.project_dir, ".activity.json"), "utf8"));
+    assert.equal(activity.appliedToday, 2, "injection itself still runs on every request: both requests counted in appliedToday");
+    assert.equal(activity.firedToday, 1, "firedToday only counts the first of the two identical-text requests");
+  }
+
+  // --- same sessionID, a different latest user text: fired bumps again ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("inject-dedupe-diff");
+    const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+    const { ctx, hooks } = makeInjectHarness(projectDir);
+
+    const project = await resolveProject(ctx, options);
+    await writeInstinct(
+      project.instincts_personal,
+      { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+      "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+    );
+
+    await registerInject(ctx, options);
+
+    await hooks.context(contextEvent({ sessionID: "turn-s2", userText: "please grep this unfamiliar repository before editing anything" }));
+    await hooks.context(contextEvent({ sessionID: "turn-s2", userText: "grep the unfamiliar repository before editing again, differently" }));
+
+    const content = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+    assert.ok(/fired:\s*2/.test(content), "a genuinely new prompt (different latest user text) in the same session bumps fired again, for a total of 2");
+  }
+
+  // --- child session: still injected, never bumps fired ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("inject-child");
+    const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+    const sessionGet = async ({ sessionID }) => ({ data: { id: sessionID, parentID: "ses_parent" } });
+    const { ctx, hooks } = makeInjectHarness(projectDir, sessionGet);
+
+    const project = await resolveProject(ctx, options);
+    await writeInstinct(
+      project.instincts_personal,
+      { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+      "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+    );
+
+    await registerInject(ctx, options);
+    const event = contextEvent({ sessionID: "child-s1", userText: "please grep this unfamiliar repository before editing anything" });
+    await hooks.context(event);
+
+    assert.equal(event.system.length, 1, "a child session's request still receives the injected block");
+    assert.ok(event.system[0].text.includes("Search the repository with grep before editing unfamiliar files."), "the injected block carries the qualifying instinct even for a child session");
+
+    const content = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+    assert.ok(!/fired:/.test(content), "a child session (session.get resolves a parentID) never bumps fired, even on a wording match");
+
+    const activity = JSON.parse(await fs.readFile(path.join(project.project_dir, ".activity.json"), "utf8"));
+    assert.equal(activity.appliedToday, 1, "appliedToday still counts the child session's injection");
+    assert.equal(Number(activity.firedToday) || 0, 0, "firedToday stays 0 for a child session");
+  }
+
+  // --- session.get throws: treated as top-level, fired still bumps ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("inject-session-get-throws");
+    const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+    const sessionGet = async () => {
+      throw new Error("session lookup unavailable");
+    };
+    const { ctx, hooks } = makeInjectHarness(projectDir, sessionGet);
+
+    const project = await resolveProject(ctx, options);
+    await writeInstinct(
+      project.instincts_personal,
+      { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+      "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+    );
+
+    await registerInject(ctx, options);
+    await hooks.context(contextEvent({ sessionID: "throws-s1", userText: "please grep this unfamiliar repository before editing anything" }));
+
+    const content = await fs.readFile(path.join(project.instincts_personal, "grep-before-edit.md"), "utf8");
+    assert.ok(/fired:\s*1/.test(content), "a session.get that throws is treated as top-level (not a child), so fired still bumps");
+  }
+
+  // --- fired-miss log: a repeated request never appends a second miss line ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("inject-dedupe-miss-log");
+    const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+    const { ctx, hooks } = makeInjectHarness(projectDir);
+
+    const project = await resolveProject(ctx, options);
+    await writeInstinct(
+      project.instincts_personal,
+      { id: "grep-before-edit", trigger: "grep unfamiliar repository before editing", confidence: 0.9, domain: "workflow" },
+      "# Grep Before Edit\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n",
+    );
+
+    await registerInject(ctx, options);
+    // Shares exactly 2 significant words (unfamiliar, repository): a near
+    // miss, logged to fired-misses.log instead of bumping fired.
+    const nearMissText = "the unfamiliar repository needs cleanup";
+    await hooks.context(contextEvent({ sessionID: "turn-miss-1", userText: nearMissText }));
+    await hooks.context(contextEvent({ sessionID: "turn-miss-1", userText: nearMissText }));
+
+    const missLogPath = path.join(project.project_dir, "fired-misses.log");
+    const missLines = (await fs.readFile(missLogPath, "utf8")).split("\n").filter((line) => line.trim().length > 0);
+    assert.equal(missLines.length, 1, "a repeated request carrying the same near-miss text never appends a second miss line");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 14. lib/maintain.js: every maintenance step against a temp data dir.
 //     promote across two fake projects (exact-id match), prune an old
 //     pending file (plus a soon-to-expire warning and an unaffected
