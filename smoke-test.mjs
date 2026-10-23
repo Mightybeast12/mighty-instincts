@@ -18,6 +18,7 @@ import { PKG_NAME } from "./lib/pkg.js";
 import {
   MAINTENANCE_DEFAULTS,
   classifyNewInstinct,
+  cleanupProjectsStep,
   decayStep,
   dedupeOrMerge,
   evolveStep,
@@ -26,6 +27,7 @@ import {
   pruneCandidatesStep,
   pruneStep,
   repairStep,
+  runMaintenance,
 } from "./lib/maintain.js";
 import {
   findCandidateById,
@@ -398,6 +400,96 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await cleanup();
   assert.ok(harness.registrations.length > 0, "cleanup had registrations to dispose");
   assert.ok(harness.registrations.every((registration) => registration.disposed), "cleanup disposed every registration");
+}
+
+// ---------------------------------------------------------------------------
+// 1a. lib/commands.js's postResult: long output (most commonly
+//     /instinct-status against a project with many instincts) used to be
+//     posted as one oversized synthetic message that the host silently
+//     cuts off mid-entry. Over SYNTHETIC_MESSAGE_CAP, it is now split at
+//     instinct-cli.py's own entry boundaries (a blank line right before a
+//     confidence-bar line, e.g. "████████░░") into several consecutive
+//     messages, each prefixed "(part N of M)", never cutting an entry's
+//     own lines apart. Exercised with a fake 30-entry CLI output, so this
+//     never depends on the real python CLI producing enough real
+//     instincts to cross the cap.
+// ---------------------------------------------------------------------------
+{
+  const { postResult, splitForSyntheticMessage, SYNTHETIC_MESSAGE_CAP } = await import("./lib/commands.js");
+
+  assert.equal(SYNTHETIC_MESSAGE_CAP, 12000, "conservative assumed cap (no documented limit for ctx.session.synthetic's own text field)");
+
+  function fakeEntry(i) {
+    return [
+      `    ████████░░  80%  habit-${i} [project]`,
+      `              trigger: always run the full smoke test suite before pushing any change to branch number ${i} in this long-running repository`,
+      `              action: run npm test and npm run lint before opening a pull request for change number ${i} in this project`,
+    ].join("\n");
+  }
+  const fakeStatus = [
+    "============================================================",
+    "  INSTINCT STATUS - 30 total",
+    "============================================================",
+    "",
+    "## PROJECT-SCOPED (demo)",
+    "",
+    ...Array.from({ length: 30 }, (_, i) => fakeEntry(i)),
+  ].join("\n\n");
+  // A smaller, explicit cap than the real default (SYNTHETIC_MESSAGE_CAP,
+  // asserted above) makes splitting deterministic here without needing an
+  // implausibly large 30-entry fixture to naturally cross 12000 chars.
+  const TEST_CAP = 3000;
+  assert.ok(fakeStatus.length > TEST_CAP, "the fake 30-entry fixture is deliberately bigger than the test cap, so splitting actually has to happen");
+
+  // --- the pure split function itself -----------------------------------
+  const underCap = splitForSyntheticMessage("short output", TEST_CAP);
+  assert.deepEqual(underCap, ["short output"], "text under the cap is returned as a single, unmodified part");
+
+  const parts = splitForSyntheticMessage(fakeStatus, TEST_CAP);
+  assert.ok(parts.length > 1, "the 30-entry fixture is split into more than one part");
+  for (const part of parts) assert.ok(part.length <= TEST_CAP, "every part fits within the cap");
+  assert.equal(parts.join("\n\n"), fakeStatus, "rejoining every part on the same separator it was split on reproduces the original text exactly");
+  // Every entry's own three lines must land in exactly one part: splitting
+  // at the wrong place (mid-entry) would separate a "habit-N [project]"
+  // bar line from its own "trigger:"/"action:" continuation lines.
+  for (let i = 0; i < 30; i++) {
+    const entry = fakeEntry(i);
+    assert.ok(parts.some((part) => part.includes(entry)), `entry ${i} lands whole inside exactly one part`);
+  }
+
+  // With no entry boundary to split at (no bar-style lines at all),
+  // oversized text is kept whole rather than cut at an arbitrary offset.
+  assert.deepEqual(splitForSyntheticMessage("no bar lines here, just one long line".repeat(50), 50).length, 1);
+
+  // --- postResult: each part posted as its own synthetic message,
+  //     consecutively, each labelled "(part N of M)" -------------------
+  const { ctx } = createPluginHarness(path.join(TEMP_ROOT, "postresult-split"), {});
+  const syntheticCalls = [];
+  ctx.session.synthetic = async (input) => {
+    syntheticCalls.push(input);
+    return {};
+  };
+  await postResult(ctx, "split-session", fakeStatus, TEST_CAP);
+  assert.equal(syntheticCalls.length, parts.length, "one synthetic message per split part");
+  syntheticCalls.forEach((call, index) => {
+    assert.equal(call.sessionID, "split-session");
+    assert.equal(call.resume, true);
+    assert.equal(call.delivery, "queue");
+    assert.ok(call.text.startsWith(`(part ${index + 1} of ${parts.length})\n`), `message ${index} carries its own '(part N of M)' prefix`);
+    assert.ok(call.text.includes(parts[index]), "the message's own part is wrapped in the usual code fence");
+  });
+
+  // Short output (the common case) still posts as exactly one message,
+  // with no "(part N of M)" prefix at all, using the real default cap.
+  const shortCalls = [];
+  const shortCtx = createPluginHarness(path.join(TEMP_ROOT, "postresult-short"), {}).ctx;
+  shortCtx.session.synthetic = async (input) => {
+    shortCalls.push(input);
+    return {};
+  };
+  await postResult(shortCtx, "s", "No instincts found.");
+  assert.equal(shortCalls.length, 1);
+  assert.ok(!shortCalls[0].text.includes("part 1 of"), "short output never gets a '(part N of M)' prefix");
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +936,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(state.instincts.global, 0, "no global-personal instinct files");
   assert.equal(state.instincts.lastRun, lastRunAt);
   assert.equal(state.instincts.pendingObservations, 14, "19 lines on disk minus 5 counted last run");
+  assert.equal(state.instincts.minObservations, 20, "default minObservations (options.observer here sets no override)");
   assert.equal(
     state.instincts.nextRunEligibleAt,
     new Date(new Date(lastRunAt).getTime() + 10 * 60000).toISOString(),
@@ -871,12 +964,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(state.instincts.lastObservedAt, null, "no .activity.json written in this fixture, so lastObservedAt stays null");
   assert.equal(state.instincts.appliedToday, 0, "no .activity.json written in this fixture, so appliedToday stays 0");
   assert.equal(state.instincts.firedToday, 0, "no .activity.json written in this fixture, so firedToday stays 0");
+  assert.equal(state.instincts.firedThisWeek, 0, "no .activity.json written in this fixture, so firedThisWeek stays 0");
   assert.equal(state.instincts.awaitingFirstUse, 0, "no instincts/pending directory exists yet");
   assert.equal(state.instincts.skillCandidates, 0, "no evolved/ candidate files exist yet");
   assert.equal(state.instincts.candidatesPath, project.evolved_dir, "the hint path is the project's own evolved dir");
   assert.deepEqual(
     state.instincts.maintenance,
-    { lastRunAt: null, lastEvolveAt: null, counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0 } },
+    { lastRunAt: null, lastEvolveAt: null, lastCleanupAt: null, counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0, cleaned: 0 } },
     "no maintenance.log yet, so the maintenance summary is all-empty",
   );
 
@@ -914,9 +1008,10 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 //     alone): a long-idle lastRunAt (interval long since elapsed) used to
 //     leave nextRunEligibleAt reading as a stale, confusing duration once
 //     relativeTime (direction-free) formatted it; "ready" now covers the
-//     "both gates already pass" case explicitly, and no ETA is given at
-//     all once only the observation count is still outstanding (there is
-//     no future timestamp to compute that from).
+//     "both gates already pass" case explicitly, and the gap once left
+//     open when only the observation count is still outstanding (there is
+//     no future timestamp to compute an ETA from) now reads as a concrete
+//     "after N more events (M so far)" instead of omitting the row.
 // ---------------------------------------------------------------------------
 {
   const { refreshBoardState } = await import("./lib/board.js");
@@ -943,11 +1038,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   // Case 2: only 4 pending lines (minObservations still 10): the interval
   // gate alone is not the whole story, and there is no future timestamp to
   // predict when enough new activity will arrive, so neither "ready" nor
-  // an ETA is shown.
+  // a relativeTime ETA is shown; the gate instead reads as a concrete
+  // "N more events needed" count.
   await fs.writeFile(project.observations_file, Array.from({ length: 4 }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n", "utf8");
   const waitingState = await refreshBoardState(ctx, options);
   assert.equal(waitingState.instincts.nextRunReady, false, "interval elapsed but minObservations not met: not ready");
   assert.equal(waitingState.instincts.nextRunEligibleAt, null, "no ETA exists for 'waiting on more activity'; it is not a time-bound wait");
+  assert.equal(waitingState.instincts.minObservations, 10, "the gate's own minObservations is carried onto the board state too");
+  assert.equal(waitingState.instincts.pendingObservations, 4);
 
   const { buildInstinctsBlock } = await import("./lib/board-text.js");
   assert.ok(
@@ -955,8 +1053,8 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     "the sidebar/board block model shows 'ready' instead of a relativeTime duration",
   );
   assert.ok(
-    !buildInstinctsBlock(waitingState.instincts).rows.some((row) => row.label === "next learning run"),
-    "with no ETA and not ready, the row is omitted rather than showing a confusing value",
+    buildInstinctsBlock(waitingState.instincts).rows.some((row) => row.label === "next learning run" && row.value === "after 6 more events (4 so far)"),
+    "with no ETA and not ready, the row reads as a concrete 'N more events needed' count instead of being omitted",
   );
 }
 
@@ -1075,13 +1173,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
 // ---------------------------------------------------------------------------
 // 7. /board summary text (lib/board-format.js): a brief, explanatory chat
-//    reply (one headline line per block, then plain-language sentences),
-//    not the sidebar's table-like rows. Must never throw, including when
-//    the board has not been written yet or every block reports itself
-//    unavailable, must read its facts through lib/board-text.js's own
-//    block builders (so it can never show a glyph/availability state the
-//    sidebar itself would disagree with), and must end with the same
-//    legend row the sidebar panel's own footer uses.
+//    reply (glyph, then a padded label, then each block's key facts on one
+//    headline line, then indented plain-language body lines), not the
+//    sidebar's table-like rows. Must never throw, including when the board
+//    has not been written yet or every block reports itself unavailable,
+//    must read its facts through lib/board-text.js's own block builders (so
+//    it can never show a glyph/availability state the sidebar itself would
+//    disagree with), and must end with the same legend row the sidebar
+//    panel's own footer uses.
 // ---------------------------------------------------------------------------
 {
   const { formatBoardSummary } = await import("./lib/board-format.js");
@@ -1108,6 +1207,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(summary.includes("Skill notes"), "the observations block renders under its plain-language label");
   assert.ok(summary.includes("Skill test"), "the evals block (no skill name on record) renders as the bare 'Skill test' label");
   assert.ok(summary.includes("none"), "an unavailable block's headline reads 'none'");
+  assert.ok(summary.startsWith("\u25cb Learned habits"), "circle before the label, even for an unavailable block");
   assert.ok(summary.includes("active") && summary.includes("needs attention") && summary.includes("stale"), "the legend row is always appended");
   assert.ok(!/[\u2014\u2013]/.test(summary), "/board text never contains an em or en dash");
 
@@ -1115,9 +1215,9 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(disabledSections, "No board sections enabled.", "every block can be hidden independently");
 
   // A fuller, "everything available" state exercises the actual
-  // explanatory content: the top-3-habits-fired-today list, the
-  // "habits in prompts" eligibility figure (not a per-day count), the
-  // next-run phrasing, and the /promote hint.
+  // explanatory content: the headline's total/in-prompts/used-today(week)
+  // figures, the "Most used today:" list (counts differ, so it is not
+  // "Used today:"), the next-run phrasing, and the compact /promote hint.
   const richState = {
     updatedAt: new Date().toISOString(),
     instincts: {
@@ -1129,6 +1229,8 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       lastRun: new Date().toISOString(),
       habitsInPrompts: 6,
       readyToShare: 3,
+      firedToday: 4,
+      firedThisWeek: 14,
       firedTodayTop: [
         { id: "grep-before-edit", count: 3, summary: "Search the repo before editing unfamiliar files." },
         { id: "run-tests-first", count: 1, summary: "Run the test suite before pushing." },
@@ -1148,19 +1250,118 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     },
   };
   const richSummary = formatBoardSummary(richState, {});
-  assert.ok(richSummary.includes("16 total"), "the headline still carries project+inherited+global");
-  assert.ok(richSummary.includes("6 eligible for prompts right now"), "habitsInPrompts reads as a live eligibility count, not a per-day tally");
-  assert.ok(richSummary.includes("Top habits used today:"), "the top-3-fired-today list has its own intro line");
-  assert.ok(richSummary.includes("1. grep-before-edit (3x): Search the repo before editing unfamiliar files."), "each habit line carries its id, fired count, and clipped summary");
-  assert.ok(richSummary.includes("2. run-tests-first (1x): Run the test suite before pushing."));
-  assert.ok(richSummary.includes("Next learning run: ready."), "nextRunReady reads as 'ready', never a relativeTime duration");
-  assert.ok(richSummary.includes("3 are confident enough to promote globally: run /promote to share them."), "the /promote hint only appears once readyToShare is positive");
-  assert.ok(richSummary.includes("398 open, 158 added this week"), "Skill notes stays a single sentence");
-  assert.ok(richSummary.includes("92% with the skill vs 8% without"), "Skill test stays a single sentence");
+  assert.ok(richSummary.startsWith("\u25cf Learned habits"), "circle before the label");
+  assert.ok(richSummary.includes("16 total, 6 in prompts, 4 used today (14 this week)"), "the headline carries project+inherited+global, live eligibility, and today/this-week fired counts");
+  assert.ok(
+    richSummary.includes("Most used today: grep-before-edit (3x): Search the repo before editing unfamiliar files."),
+    "counts differ (3x vs 1x), so the list reads 'Most used today:', each entry carrying its id, fired count, and summary",
+  );
+  assert.ok(richSummary.includes("run-tests-first (1x): Run the test suite before pushing."), "every fired-today habit is listed, not just the first");
+  assert.ok(richSummary.includes("Next learning run ready. 3 ready: /promote."), "nextRunReady reads as 'ready', and the /promote hint rides the same line once readyToShare is positive");
+  assert.ok(richSummary.includes("398 open, 158 this week, never reviewed."), "Skill notes stays a single headline line");
+  assert.ok(richSummary.includes("last measured 2d ago, 92% with the skill vs 8% without."), "Skill test stays a single headline line");
   assert.ok(!/[\u2014\u2013]/.test(richSummary), "/board text never contains an em or en dash");
 
   const noHabitsToday = formatBoardSummary({ ...richState, instincts: { ...richState.instincts, firedTodayTop: [] } }, {});
   assert.ok(noHabitsToday.includes("No habits fired today yet."), "an empty top-habits list reads as a plain sentence, not an empty list header");
+
+  // "Used today:" (no "Top"/"Most") once every listed habit fired exactly
+  // once: nothing to rank, so the wording never implies an ordering.
+  const allOnesSummary = formatBoardSummary(
+    { ...richState, instincts: { ...richState.instincts, firedTodayTop: [{ id: "habit-a", count: 1, summary: "Do A." }, { id: "habit-b", count: 1, summary: "Do B." }] } },
+    {},
+  );
+  assert.ok(allOnesSummary.includes("Used today: habit-a (1x): Do A."), "every count is 1: 'Used today:', not 'Most used today:'");
+  assert.ok(!allOnesSummary.includes("Most used today:"));
+  assert.ok(allOnesSummary.includes("habit-b (1x): Do B."));
+
+  // The three next-learning-run phrasings: "ready" (above), "in <rel>"
+  // (still waiting on the interval), and "after N more events (M so
+  // far)" (interval elapsed, but not enough observed yet).
+  const waitingOnIntervalSummary = formatBoardSummary(
+    {
+      ...richState,
+      instincts: { ...richState.instincts, nextRunReady: false, nextRunEligibleAt: new Date(Date.now() + 5 * 60000).toISOString(), readyToShare: 0 },
+    },
+    {},
+  );
+  assert.ok(waitingOnIntervalSummary.includes("Next learning run in 5m."), "still waiting on the interval itself reads 'in <rel>'");
+
+  const waitingOnEventsSummary = formatBoardSummary(
+    {
+      ...richState,
+      instincts: { ...richState.instincts, nextRunReady: false, nextRunEligibleAt: null, minObservations: 20, pendingObservations: 6, readyToShare: 0 },
+    },
+    {},
+  );
+  assert.ok(waitingOnEventsSummary.includes("Next learning run after 14 more events (6 so far)."), "the interval has elapsed but minObservations has not: a concrete count, not a vague 'waiting on more activity'");
+  assert.ok(!waitingOnEventsSummary.includes("ready:"), "no /promote hint when readyToShare is 0");
+
+  // Skill notes: ": review overdue" appended only when the warning flag
+  // (lib/board-observations.js's own open>100-and-stale-review rule) is set.
+  const overdueSummary = formatBoardSummary({ ...richState, observations: { ...richState.observations, open: 467, added7d: 167, warning: true } }, {});
+  assert.ok(overdueSummary.includes("467 open, 167 this week, never reviewed: review overdue."), "the warning flag appends ': review overdue' to the same headline line");
+
+  // Skill test: "no measurable difference" (and a stale, not active,
+  // glyph) once |with - baseline| < 0.05, even though the benchmark
+  // itself is fresh.
+  const noDifferenceSummary = formatBoardSummary(
+    { ...richState, evals: { ...richState.evals, withSkill: 1, baseline: 1, timestamp: new Date(Date.now() - 4 * 86400000).toISOString() } },
+    {},
+  );
+  assert.ok(noDifferenceSummary.includes("\u25cb Skill test (pr)  no measurable difference last run (100% vs 100%, 4d ago)."), "a near-zero difference reads 'no measurable difference' with a stale (hollow) glyph, matching the target format exactly");
+}
+
+// ---------------------------------------------------------------------------
+// 7a. lib/board.js's firedTodayTop: capped at 5 (not 3), sorted by count
+//     desc then id, and clipped at a word boundary (lib/store.js's
+//     clipSummaryWordBoundary) at 100 chars, not mid-word, since the
+//     /board chat reply has no 36-column sidebar budget to justify a hard
+//     character cut. Exercised end to end through lib/activity.js's
+//     recordFired and lib/board.js's refreshBoardState, with a fake CLI
+//     output irrelevant here (this is the board, not /instinct-status).
+// ---------------------------------------------------------------------------
+{
+  const { refreshBoardState } = await import("./lib/board.js");
+  const { recordFired } = await import("./lib/activity.js");
+
+  const { projectDir, dataDir } = makeProjectAndData("board-fired-top");
+  const options = { python: "python3", dataDir, board: { enabled: true } };
+  const ctx = { location: { directory: projectDir } };
+  const project = await resolveProject(ctx, options);
+
+  const longSummary =
+    "Always search the entire repository with grep for every existing usage of a helper before editing or renaming it so nothing downstream silently breaks";
+  await writeInstinct(project.instincts_personal, { id: "habit-0", trigger: "t0", confidence: 0.9, domain: "workflow", summary: longSummary }, "# 0\n");
+  for (let i = 1; i <= 5; i++) {
+    await writeInstinct(project.instincts_personal, { id: `habit-${i}`, trigger: `t${i}`, confidence: 0.9, domain: "workflow", summary: `Do habit ${i}.` }, `# ${i}\n`);
+  }
+
+  // habit-0: 5x, habit-1: 4x, habit-2: 3x, habit-3: 2x, habit-4 and
+  // habit-5: 1x each (a tie broken by id, so habit-4 edges out habit-5
+  // for the 5th and final slot).
+  await recordFired(project.project_dir, "habit-0", 5);
+  await recordFired(project.project_dir, "habit-1", 4);
+  await recordFired(project.project_dir, "habit-2", 3);
+  await recordFired(project.project_dir, "habit-3", 2);
+  await recordFired(project.project_dir, "habit-4", 1);
+  await recordFired(project.project_dir, "habit-5", 1);
+
+  const state = await refreshBoardState(ctx, options);
+  assert.equal(state.instincts.firedTodayTop.length, 5, "capped at 5, not 3");
+  assert.deepEqual(
+    state.instincts.firedTodayTop.map((entry) => entry.id),
+    ["habit-0", "habit-1", "habit-2", "habit-3", "habit-4"],
+    "sorted by count desc, ties broken by id; habit-5 (the 6th, tied at 1x) is dropped",
+  );
+  assert.equal(state.instincts.firedToday, 16, "5+4+3+2+1+1 fired today, summed across every id");
+  assert.equal(state.instincts.firedThisWeek, 16, "the same activity, all today, sums into the 7-day rollup too");
+
+  const longEntry = state.instincts.firedTodayTop.find((entry) => entry.id === "habit-0");
+  assert.ok(longEntry.summary.length <= 100, "clipped at (or under) 100 chars");
+  assert.ok(longSummary.startsWith(longEntry.summary), "the clip is a clean prefix of the original text");
+  assert.ok(!/\s$/.test(longEntry.summary), "no trailing space left behind by backing off to the last word boundary");
+  assert.ok(longSummary[longEntry.summary.length] === undefined || longSummary[longEntry.summary.length] === " ", "the cut lands exactly on a word boundary, never mid-word");
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,30 +1469,58 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.label === "unused candidates"), "unusedCandidates: 0 omits the row entirely");
 
   // --- "habits in prompts": a live eligibility count, shown even at 0
-  //     (unlike "used by the agent today", a per-day tally that still
-  //     hides at 0) -------------------------------------------------------
-  const noHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 0, firedToday: 0 });
+  //     (unlike "used today / this week", a per-day/per-week tally that
+  //     still hides when nothing fired this week) -----------------------
+  const noHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 0, firedToday: 0, firedThisWeek: 0 });
   assert.ok(noHabitsInPrompts.rows.some((row) => row.label === "habits in prompts" && row.value === "0"), "a zero (known) habitsInPrompts still renders its own row");
-  assert.ok(!noHabitsInPrompts.rows.some((row) => row.label === "used by the agent today"), "firedToday 0 still omits its own row");
-  const withHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 5, firedToday: 2 });
+  assert.ok(!noHabitsInPrompts.rows.some((row) => row.label === "used today / this week"), "firedThisWeek 0 still omits its own row");
+  const withHabitsInPrompts = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), habitsInPrompts: 5, firedToday: 2, firedThisWeek: 9 });
   assert.ok(withHabitsInPrompts.rows.some((row) => row.label === "habits in prompts" && row.value === "5"));
-  assert.ok(withHabitsInPrompts.rows.some((row) => row.label === "used by the agent today" && row.value === "2"));
+  assert.ok(withHabitsInPrompts.rows.some((row) => row.label === "used today / this week" && row.value === "2 / 9"), "the row combines today's count and the 7-day rollup as 'today / week'");
   const noHabitsInPromptsField = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString() });
   assert.ok(!noHabitsInPromptsField.rows.some((row) => row.label === "habits in prompts"), "habitsInPrompts missing entirely (e.g. an older board-state.json) omits the row rather than showing a bare 'null'");
 
   // --- "next learning run": "ready" takes priority over a computed ETA,
-  //     since relativeTime has no "ago"/"in" direction of its own ------
+  //     which itself now reads "in <rel>"; once neither applies, the
+  //     minObservations gate (not the interval) renders as a concrete
+  //     "after N more events (M so far)" instead of the row being
+  //     omitted ---------------------------------------------------------
   const readyModel = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), nextRunReady: true, nextRunEligibleAt: null });
   assert.ok(readyModel.rows.some((row) => row.label === "next learning run" && row.value === "ready"), "nextRunReady shows 'ready', not a duration");
+  const etaModel = buildInstinctsBlock({
+    project: 1,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    nextRunReady: false,
+    nextRunEligibleAt: new Date(Date.now() + 3 * 60000).toISOString(),
+  });
+  assert.ok(etaModel.rows.some((row) => row.label === "next learning run" && row.value === "in 3m"), "a future ETA reads 'in <rel>', with the direction word baked in");
   const noEtaModel = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), nextRunReady: false, nextRunEligibleAt: null });
-  assert.ok(!noEtaModel.rows.some((row) => row.label === "next learning run"), "neither ready nor a known ETA: the row is omitted entirely");
+  assert.ok(!noEtaModel.rows.some((row) => row.label === "next learning run"), "neither ready, a known ETA, nor a minObservations/pendingObservations count: the row is omitted entirely");
+  const gateCountModel = buildInstinctsBlock({
+    project: 1,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    nextRunReady: false,
+    nextRunEligibleAt: null,
+    minObservations: 20,
+    pendingObservations: 6,
+  });
+  assert.ok(
+    gateCountModel.rows.some((row) => row.label === "next learning run" && row.value === "after 14 more events (6 so far)"),
+    "the interval has elapsed but minObservations has not: a concrete 'N more events needed' count, not an omitted row",
+  );
 
   // --- "kept tidy" summary row: omitted when all-zero, joined otherwise
-  const keptTidyEmpty = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0 } } });
+  const keptTidyEmpty = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 0, archived: 0, merged: 0, pruned: 0, candidates: 0, repaired: 0, cleaned: 0 } } });
   assert.ok(!keptTidyEmpty.rows.some((row) => row.label === "kept tidy"), "an all-zero week omits the 'kept tidy' row");
-  const keptTidySome = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 1, archived: 2, merged: 0, pruned: 0, candidates: 0, repaired: 0 } } });
+  const keptTidySome = buildInstinctsBlock({ project: 1, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), maintenance: { counts7d: { promoted: 1, archived: 2, merged: 0, pruned: 0, candidates: 0, repaired: 0, cleaned: 3 } } });
   const keptTidyRow = keptTidySome.rows.find((row) => row.label === "kept tidy");
-  assert.equal(keptTidyRow.value, "promoted 1, archived 2", "zero items are omitted, nonzero ones joined in a fixed order");
+  assert.equal(keptTidyRow.value, "promoted 1, archived 2, cleaned 3", "zero items are omitted, nonzero ones (including the new 'cleaned' count) joined in a fixed order");
 
   // --- buildObservationsBlock ------------------------------------------
   assert.deepEqual(buildObservationsBlock(null), { key: "observations", label: "Skill notes", available: false, glyph: "stale", headline: "none", rows: [] });
@@ -1323,6 +1552,26 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   const evalsOldNaming = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "old", timestamp: new Date().toISOString() });
   assert.deepEqual(evalsOldNaming.rows, [{ label: "new", value: "92%" }, { label: "old", value: "8%" }], "the 'old_skill' naming reads 'new'/'old' instead of 'with skill'/'without'");
+
+  // --- buildEvalsBlock: "no measurable difference" (|with - baseline| <
+  //     0.05) reads stale even though the benchmark itself is fresh, and
+  //     a negative difference (the skill measured worse) reads stale too,
+  //     even well outside that narrow band -------------------------------
+  const evalsNoDifference = buildEvalsBlock({ available: true, skill: "pr", withSkill: 1, baseline: 1, baselineKind: "without", timestamp: new Date(Date.now() - 4 * 86400000).toISOString() });
+  assert.equal(evalsNoDifference.glyph, "stale", "a fresh benchmark with no measurable difference still reads stale");
+  assert.equal(evalsNoDifference.noMeasurableDifference, true);
+
+  const evalsSmallPositive = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.52, baseline: 0.5, baselineKind: "without", timestamp: new Date().toISOString() });
+  assert.equal(evalsSmallPositive.noMeasurableDifference, true, "a +0.02 difference is still inside the 0.05 'no measurable difference' band");
+  assert.equal(evalsSmallPositive.glyph, "stale");
+
+  const evalsRegression = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.4, baseline: 0.8, baselineKind: "without", timestamp: new Date().toISOString() });
+  assert.equal(evalsRegression.glyph, "stale", "a large negative difference (the skill measured worse) reads stale too, not just the near-zero band");
+  assert.equal(evalsRegression.noMeasurableDifference, false, "a large regression is not worded as 'no measurable difference'; it is just stale");
+
+  const evalsRealImprovement = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date().toISOString() });
+  assert.equal(evalsRealImprovement.glyph, "active", "a real, fresh improvement still reads active");
+  assert.equal(evalsRealImprovement.noMeasurableDifference, false);
 
   // --- shared glyph/legend constants ------------------------------------
   assert.deepEqual(GLYPH_CHAR, { active: "\u25cf", attention: "\u25cf", stale: "\u25cb" });
@@ -1388,6 +1637,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(before.lastObservedAt, null, "no .activity.json yet: lastObservedAt starts null");
   assert.equal(before.appliedToday, 0, "no .activity.json yet: appliedToday starts 0");
   assert.equal(before.firedToday, 0, "no .activity.json yet: firedToday starts 0");
+  assert.equal(before.firedThisWeek, 0, "no .activity.json yet: firedThisWeek starts 0");
   assert.deepEqual(before.firedByIdToday, {}, "no .activity.json yet: firedByIdToday starts empty");
 
   await recordObserved(projectDir);
@@ -1406,6 +1656,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const afterApplied = await readActivitySnapshot(projectDir);
   assert.equal(afterApplied.appliedToday, 5, "recordApplied accumulates within the same day");
   assert.equal(afterApplied.firedToday, 4, "recordFired's aggregate accumulates within the same day, independently of appliedToday");
+  assert.equal(afterApplied.firedThisWeek, 4, "the same day's total also lands in the 7-day rollup (today is within the last 7 days)");
   assert.deepEqual(afterApplied.firedByIdToday, { "habit-a": 2, "habit-b": 2 }, "per-id fired-today counts accumulate alongside the aggregate");
   assert.ok(
     typeof afterApplied.lastObservedAt === "string" && !Number.isNaN(Date.parse(afterApplied.lastObservedAt)),
@@ -1428,6 +1679,40 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(afterStaleDate.appliedToday, 0, "appliedToday from a different (stale) date reads as 0 for today");
   assert.equal(afterStaleDate.firedToday, 0, "firedToday from a different (stale) date reads as 0 for today");
   assert.deepEqual(afterStaleDate.firedByIdToday, {}, "firedByIdToday from a different (stale) date reads as empty for today");
+  assert.equal(afterStaleDate.firedThisWeek, 4, "firedThisWeek is tracked per real calendar day (firedByDay), independently of the stale firedDate/firedToday override above");
+}
+
+// ---------------------------------------------------------------------------
+// 10a. lib/activity.js: firedByDay keeps at most FIRED_HISTORY_DAYS (7)
+//      days, today inclusive; a day older than that is excluded from
+//      firedThisWeek and pruned from the file on the very next
+//      recordFired write, so this file never grows unbounded.
+// ---------------------------------------------------------------------------
+{
+  const { recordFired, readActivitySnapshot } = await import("./lib/activity.js");
+
+  const { projectDir: historyDir } = makeProjectAndData("activity-history");
+  await fs.mkdir(historyDir, { recursive: true });
+  const historyPath = path.join(historyDir, ".activity.json");
+
+  const today = new Date().toISOString().slice(0, 10);
+  const withinWindow = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+  const outsideWindow = new Date(Date.now() - 10 * 86400000).toISOString().slice(0, 10);
+  await fs.writeFile(historyPath, JSON.stringify({ firedByDay: { [outsideWindow]: 50, [withinWindow]: 7 } }), "utf8");
+
+  const beforeRecord = await readActivitySnapshot(historyDir);
+  assert.equal(beforeRecord.firedThisWeek, 7, "a day 10 days ago is outside the 7-day window and never counted");
+
+  await recordFired(historyDir, "habit-x", 2);
+  const afterRecord = await readActivitySnapshot(historyDir);
+  assert.equal(afterRecord.firedThisWeek, 9, "7 (3 days ago) + 2 (today) once the new fire lands");
+
+  const onDisk = JSON.parse(await fs.readFile(historyPath, "utf8"));
+  assert.deepEqual(
+    Object.keys(onDisk.firedByDay).sort(),
+    [withinWindow, today].sort(),
+    "the 10-days-ago entry is pruned from disk on the very next write, keeping the file from growing unbounded",
+  );
 }
 
 
@@ -1896,6 +2181,40 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const secondPromote = await promoteStep(promoteOptions, { log: () => {} });
   assert.equal(secondPromote, 0, "an instinct already in the global store is never promoted twice");
 
+  // --- promote: second qualification path (0.8.2) - confidence >= 0.9
+  //     and fired >= 3 in a single project, no cross-project
+  //     corroboration needed at all ---------------------------------------
+  const provenHome = path.join(maintRoot, "homunculus-proven");
+  const provenPersonal = path.join(provenHome, "projects", "proj-solo", "instincts", "personal");
+  await fs.mkdir(provenPersonal, { recursive: true });
+  await writeInstinct(
+    provenPersonal,
+    { id: "proven-on-its-own", trigger: "always run the full build before tagging a release", confidence: 0.95, domain: "release", summary: "Run the full build before tagging a release.", fired: 4, created: new Date().toISOString() },
+    "# Proven\n\n## Action\nRun the full build.\n",
+  );
+  // Confident enough for the cross-project path's own floor (>= 0.8) but
+  // not proven enough for path 2 (fired < 3): never promoted by either path.
+  await writeInstinct(
+    provenPersonal,
+    { id: "confident-but-unused", trigger: "unrelated pattern nobody has actually used yet", confidence: 0.85, domain: "misc", summary: "Do the unrelated thing.", fired: 0, created: new Date().toISOString() },
+    "# Confident but unused\n",
+  );
+  const provenOptions = { dataDir: provenHome };
+  const provenLog = [];
+  const provenPromoted = await promoteStep(provenOptions, { log: (line) => provenLog.push(line) });
+  assert.equal(provenPromoted, 1, "exactly one instinct promotes: confidence >= 0.9 and fired >= 3, alone in its own project");
+  const provenGlobalDir = path.join(provenHome, "instincts", "personal");
+  assert.deepEqual(await fs.readdir(provenGlobalDir), ["proven-on-its-own.md"], "only the proven-on-its-own instinct is copied to the global store");
+  const provenGlobalContent = await fs.readFile(path.join(provenGlobalDir, "proven-on-its-own.md"), "utf8");
+  assert.ok(provenGlobalContent.includes("scope: global"));
+  assert.ok(
+    provenLog.some((line) => line.includes("promote: copied proven-on-its-own to global store (confidence 0.95 >= 0.9 and fired 4 >= 3 in")),
+    "the log records which path qualified (confidence+fired, not cross-project corroboration)",
+  );
+
+  const secondProvenPromote = await promoteStep(provenOptions, { log: () => {} });
+  assert.equal(secondProvenPromote, 0, "already-global instinct is never promoted a second time via either path");
+
   // --- prune: an old pending file, one within the warning window, one fresh
   const pruneProject = {
     project_dir: path.join(maintRoot, "proj-prune"),
@@ -1967,6 +2286,87 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(mergedContent.includes("Observed 3 times") && mergedContent.includes("Observed 2 more times"), "the new evidence paragraph is appended to the existing ## Evidence section");
   assert.ok(dedupeLog.some((line) => line.includes("dedupe: merged new-habit into existing-habit")));
 
+  // --- dedupe: trigger/summary overlap is compared per-field (not
+  //     concatenated), with a same-domain bonus that lowers the bar from
+  //     60% to 45% on either field --------------------------------------
+  const domainBonusDir = path.join(maintRoot, "proj-dedupe-domain", "instincts", "personal");
+  await fs.mkdir(domainBonusDir, { recursive: true });
+  await writeInstinct(domainBonusDir, { id: "zeta-existing", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta\n");
+  const domainBonusLog = [];
+  const mergedSameDomain = await dedupeOrMerge(
+    domainBonusDir,
+    { id: "zeta-same-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "alpha-domain" },
+    "# Same domain\n",
+    { log: (line) => domainBonusLog.push(line) },
+  );
+  assert.equal(mergedSameDomain, true, "50% trigger overlap alone would not qualify (< 60%), but the same-domain bonus (>= 45%) does");
+  assert.deepEqual(await fs.readdir(domainBonusDir), ["zeta-existing.md"], "merged into the existing file; no second file written");
+  assert.ok(domainBonusLog.some((line) => line.includes("dedupe: merged zeta-same-domain into zeta-existing")));
+
+  const diffDomainDir = path.join(maintRoot, "proj-dedupe-domain-diff", "instincts", "personal");
+  await fs.mkdir(diffDomainDir, { recursive: true });
+  await writeInstinct(diffDomainDir, { id: "zeta-existing-2", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta 2\n");
+  const notMergedDiffDomain = await dedupeOrMerge(
+    diffDomainDir,
+    { id: "zeta-diff-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "beta-domain" },
+    "# Diff domain\n",
+    { log: () => {} },
+  );
+  assert.equal(notMergedDiffDomain, false, "the same 50% overlap does not qualify without a shared domain (below the plain 60% threshold)");
+  assert.deepEqual(await fs.readdir(diffDomainDir), ["zeta-existing-2.md"], "dedupeOrMerge never writes anything itself when no merge target is found");
+
+  // --- dedupe: three related smoke-test habits, processed in sequence
+  //     the way lib/observer.js's write path would, all merge into one
+  //     file -----------------------------------------------------------
+  const smokeDedupeDir = path.join(maintRoot, "proj-dedupe-smoke", "instincts", "personal");
+  await fs.mkdir(smokeDedupeDir, { recursive: true });
+  await writeInstinct(
+    smokeDedupeDir,
+    {
+      id: "rerun-smoke-test-after-each-edit-batch",
+      trigger: "rerun the smoke test suite after editing each batch of files",
+      confidence: 0.6,
+      domain: "testing",
+      summary: "Rerun the smoke test suite after each edit batch.",
+      created: new Date().toISOString(),
+    },
+    "# Rerun after each batch\n",
+  );
+  const smokeDedupeLog = [];
+  const mergedFlakeCheck = await dedupeOrMerge(
+    smokeDedupeDir,
+    {
+      id: "smoke-test-flake-check-load-then-rerun",
+      trigger: "rerun the smoke test suite to check for flaky results",
+      confidence: 0.65,
+      domain: "testing",
+      summary: "Rerun the smoke test suite to check for flaky results.",
+    },
+    "# Flake check\n",
+    { log: (line) => smokeDedupeLog.push(line) },
+  );
+  assert.equal(mergedFlakeCheck, true, "smoke-test-flake-check-load-then-rerun merges into the existing rerun-smoke-test-after-each-edit-batch file");
+  const mergedRunUnderNodeAndBun = await dedupeOrMerge(
+    smokeDedupeDir,
+    {
+      id: "smoke-test-run-under-node-and-bun",
+      trigger: "rerun the smoke test suite under both node and bun runtimes",
+      confidence: 0.7,
+      domain: "testing",
+      summary: "Rerun the smoke test suite under node and bun.",
+    },
+    "# Run under node and bun\n",
+    { log: (line) => smokeDedupeLog.push(line) },
+  );
+  assert.equal(mergedRunUnderNodeAndBun, true, "smoke-test-run-under-node-and-bun also merges into the same file");
+  assert.deepEqual(
+    await fs.readdir(smokeDedupeDir),
+    ["rerun-smoke-test-after-each-edit-batch.md"],
+    "all three smoke-test habits end up as exactly one file, never three",
+  );
+  assert.ok(smokeDedupeLog.some((line) => line.includes("dedupe: merged smoke-test-flake-check-load-then-rerun into rerun-smoke-test-after-each-edit-batch")));
+  assert.ok(smokeDedupeLog.some((line) => line.includes("dedupe: merged smoke-test-run-under-node-and-bun into rerun-smoke-test-after-each-edit-batch")));
+
   // --- evolve: three overlapping testing-domain instincts propose one
   //     rule candidate (<= 3 members); re-running leaves it alone, and
   //     archiving it blocks the same cluster from ever coming back ------
@@ -2017,10 +2417,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(evolveLog3.some((line) => line.includes("evolve: skipped cluster")));
   assert.equal((await fs.readdir(evolveProject.evolved_dir)).length, 1, "still only the one, now-archived, candidate file");
 
-  // --- classifyNewInstinct: the "50% rule" ------------------------------
-  assert.equal(classifyNewInstinct({ confidence: 0.5 }, "# Body\n\n## Action\nDo it.\n"), "pending", "exactly 0.5 confidence with no Evidence section goes to pending");
-  assert.equal(classifyNewInstinct({ confidence: 0.5 }, "# Body\n\n## Action\nDo it.\n\n## Evidence\n- seen\n"), "personal", "an Evidence section exempts it from the pending rule even at 0.5");
-  assert.equal(classifyNewInstinct({ confidence: 0.51 }, "# Body\n"), "personal", "anything other than exactly 0.5 confidence is never routed to pending");
+  // --- classifyNewInstinct: the "50% rule" (0.8.2: confidence <= 0.5
+  //     always goes to pending, regardless of an Evidence section; only
+  //     an instinct that has already fired is exempt) -------------------
+  assert.equal(classifyNewInstinct({ confidence: 0.5 }), "pending", "confidence <= 0.5 goes to pending");
+  assert.equal(classifyNewInstinct({ confidence: 0.3 }), "pending", "well below 0.5 goes to pending too, not just exactly 0.5");
+  assert.equal(classifyNewInstinct({ confidence: 0.5 }, 0), "pending", "an Evidence section no longer exempts a <= 0.5 instinct from the pending rule");
+  assert.equal(classifyNewInstinct({ confidence: 0.5 }, 2), "personal", "already fired at least once (existingFired > 0): never demoted back to pending");
+  assert.equal(classifyNewInstinct({ confidence: 0.51 }), "personal", "anything above 0.5 confidence is never routed to pending");
 
   // --- graduatePendingStep: fired promotes a pending instinct to personal
   const graduateProject = {
@@ -2039,7 +2443,9 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.deepEqual(await fs.readdir(graduateProject.instincts_personal), ["used-pending.md"]);
   assert.ok(graduateLog.some((line) => line.includes("pending: promoted used-pending to personal (fired 2)")));
 
-  // --- repairStep: a leaked trailing frontmatter fragment in the trigger
+  // --- repairStep: a leaked trailing frontmatter fragment in the trigger,
+  //     plus (0.8.2) a personal instinct that never should have landed
+  //     there under the current 50% rule (confidence <= 0.5, never fired)
   const repairProject = {
     project_dir: path.join(maintRoot, "proj-repair"),
     instincts_personal: path.join(maintRoot, "proj-repair", "instincts", "personal"),
@@ -2051,16 +2457,152 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     { id: "leaky-trigger", trigger: "grep before editing unfamiliar files, confidence: 0.8", confidence: 0.8, domain: "workflow", summary: "Grep first.", created: new Date().toISOString() },
     "# Leaky\n",
   );
+  await writeInstinct(
+    repairProject.instincts_personal,
+    { id: "stale-unproven", trigger: "t", confidence: 0.4, domain: "misc", summary: "s", created: new Date().toISOString() },
+    "# Stale unproven\n",
+  );
+  await writeInstinct(
+    repairProject.instincts_personal,
+    { id: "proven-despite-low-confidence", trigger: "t", confidence: 0.3, domain: "misc", summary: "s", created: new Date().toISOString(), fired: 5 },
+    "# Proven despite low confidence\n",
+  );
   const repairLog = [];
   const repaired = await repairStep(repairProject, { log: (line) => repairLog.push(line) });
-  assert.equal(repaired, 1);
+  assert.equal(repaired, 2, "the leaky trigger and the misclassified instinct both count; the already-fired one is left alone");
   const repairedContent = await fs.readFile(path.join(repairProject.instincts_personal, "leaky-trigger.md"), "utf8");
   assert.ok(repairedContent.includes('trigger: "grep before editing unfamiliar files"'), "the trigger is cleaned back to just the real trigger text");
   assert.ok(!repairedContent.includes("files, confidence"), "the leaked trailing fragment is gone");
   assert.ok(repairLog.some((line) => line.includes("repair: cleaned trigger of leaky-trigger")));
 
+  const repairPendingDir = siblingInstinctsDir(repairProject, "pending");
+  assert.deepEqual(await fs.readdir(repairPendingDir), ["stale-unproven.md"], "the misclassified instinct is moved to pending/, not deleted");
+  assert.deepEqual(
+    (await fs.readdir(repairProject.instincts_personal)).sort(),
+    ["leaky-trigger.md", "proven-despite-low-confidence.md"].sort(),
+    "the misclassified instinct is gone from personal/; the already-fired low-confidence one stays",
+  );
+  assert.ok(repairLog.some((line) => line.includes("repair: moved stale-unproven to pending (confidence <= 0.5, never fired)")));
+
   const secondRepair = await repairStep(repairProject, { log: () => {} });
-  assert.equal(secondRepair, 0, "repairStep is idempotent: a clean trigger never matches the leaked-suffix pattern again");
+  assert.equal(secondRepair, 0, "repairStep is idempotent: a clean trigger never matches the leaked-suffix pattern again, and the misclassified instinct is already gone from personal/");
+}
+
+// ---------------------------------------------------------------------------
+// 14a. lib/maintain.js's cleanupProjectsStep (0.8.2): for every entry in
+//      ECC's own projects registry (`<homunculus>/projects.json`) whose
+//      root no longer exists, or lives under a temp directory, AND which
+//      has 0 instincts, the entry is removed and its project directory
+//      archived (never deleted outright) under `archive/projects/<id>/`.
+//      A project kept resident outside any temp directory, and a
+//      temp-rooted project that still has instincts, are both left alone.
+// ---------------------------------------------------------------------------
+{
+  const cleanupHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "cleanup-projects-"));
+  const projectsRoot = path.join(cleanupHome, "projects");
+  const registryFile = path.join(cleanupHome, "projects.json");
+
+  const vanishedRoot = path.join(cleanupHome, "vanished-project-root"); // never created: "gone"
+  const tempWithInstinctsRoot = path.join(TEMP_ROOT, "cleanup-temp-with-instincts");
+  const tempZeroInstinctsRoot = path.join(TEMP_ROOT, "cleanup-temp-zero-instincts");
+  await fs.mkdir(tempWithInstinctsRoot, { recursive: true });
+  await fs.mkdir(tempZeroInstinctsRoot, { recursive: true });
+
+  const now = new Date().toISOString();
+  const registry = {
+    "keep-resident": { id: "keep-resident", name: "resident-kept", root: os.homedir(), remote: "", created_at: now, last_seen: now },
+    "gone-root": { id: "gone-root", name: "vanished-gone", root: vanishedRoot, remote: "", created_at: now, last_seen: now },
+    "temp-with-instincts": { id: "temp-with-instincts", name: "temp-but-used", root: tempWithInstinctsRoot, remote: "", created_at: now, last_seen: now },
+    "temp-zero-instincts": { id: "temp-zero-instincts", name: "temp-and-unused", root: tempZeroInstinctsRoot, remote: "", created_at: now, last_seen: now },
+  };
+  await fs.mkdir(cleanupHome, { recursive: true });
+  await fs.writeFile(registryFile, JSON.stringify(registry, null, 2), "utf8");
+
+  // Every registered project gets a real project directory on disk, with
+  // a marker file so an archived one can be proven to still hold its
+  // real content (never deleted) after the move.
+  for (const id of Object.keys(registry)) {
+    const projectDir = path.join(projectsRoot, id);
+    await fs.mkdir(path.join(projectDir, "instincts", "personal"), { recursive: true });
+    await fs.writeFile(path.join(projectDir, "marker.txt"), id, "utf8");
+  }
+  // temp-with-instincts has an actual instinct on record, so cleanup must
+  // leave it alone despite its root being under a temp directory.
+  await writeInstinct(
+    path.join(projectsRoot, "temp-with-instincts", "instincts", "personal"),
+    { id: "still-used", trigger: "t", confidence: 0.6, domain: "misc", summary: "s" },
+    "# Still used\n",
+  );
+
+  const cleanupLog = [];
+  const cleaned = await cleanupProjectsStep({ dataDir: cleanupHome }, { log: (line) => cleanupLog.push(line) });
+  assert.equal(cleaned, 2, "gone-root (root missing) and temp-zero-instincts (root under temp, 0 instincts) are both cleaned");
+
+  const registryAfter = JSON.parse(await fs.readFile(registryFile, "utf8"));
+  assert.deepEqual(Object.keys(registryAfter).sort(), ["keep-resident", "temp-with-instincts"], "only the two legitimately-kept entries remain in the registry");
+
+  assert.ok(!(await fs.access(path.join(projectsRoot, "gone-root")).then(() => true, () => false)), "gone-root's project dir is gone from projects/");
+  assert.ok(!(await fs.access(path.join(projectsRoot, "temp-zero-instincts")).then(() => true, () => false)), "temp-zero-instincts's project dir is gone from projects/");
+  assert.ok(await fs.access(path.join(projectsRoot, "keep-resident")).then(() => true, () => false), "keep-resident's project dir is untouched");
+  assert.ok(await fs.access(path.join(projectsRoot, "temp-with-instincts")).then(() => true, () => false), "temp-with-instincts's project dir is untouched (it still has an instinct)");
+
+  const archivedGoneMarker = await fs.readFile(path.join(cleanupHome, "archive", "projects", "gone-root", "marker.txt"), "utf8");
+  assert.equal(archivedGoneMarker, "gone-root", "the archived project dir's real content survives the move (archived, never deleted)");
+  const archivedTempMarker = await fs.readFile(path.join(cleanupHome, "archive", "projects", "temp-zero-instincts", "marker.txt"), "utf8");
+  assert.equal(archivedTempMarker, "temp-zero-instincts");
+
+  assert.ok(cleanupLog.some((line) => line.includes("cleanup: archived project vanished-gone [gone-root] (root no longer exists, 0 instincts)")));
+  assert.ok(cleanupLog.some((line) => line.includes("cleanup: archived project temp-and-unused [temp-zero-instincts] (root lives under a temp directory, 0 instincts)")));
+
+  const secondCleanup = await cleanupProjectsStep({ dataDir: cleanupHome }, { log: (line) => cleanupLog.push(line) });
+  assert.equal(secondCleanup, 0, "idempotent: nothing left to clean on a second pass");
+  assert.ok(cleanupLog.some((line) => line.includes("cleanup: checked, nothing to remove")));
+
+  // --- dryRun: logs what it would do, changes nothing on disk ----------
+  const dryHome = fsSync.mkdtempSync(path.join(TEMP_ROOT, "cleanup-projects-dry-"));
+  const dryRegistryFile = path.join(dryHome, "projects.json");
+  const dryVanishedRoot = path.join(dryHome, "vanished");
+  await fs.mkdir(path.join(dryHome, "projects", "dry-gone", "instincts", "personal"), { recursive: true });
+  await fs.writeFile(dryRegistryFile, JSON.stringify({ "dry-gone": { id: "dry-gone", name: "dry-gone", root: dryVanishedRoot, remote: "", created_at: now, last_seen: now } }), "utf8");
+  const dryLog = [];
+  const dryCleaned = await cleanupProjectsStep({ dataDir: dryHome }, { dryRun: true, log: (line) => dryLog.push(line) });
+  assert.equal(dryCleaned, 0, "dry run never reports anything actually cleaned");
+  assert.ok(dryLog.some((line) => line.includes("cleanup: would archive project dry-gone [dry-gone]")));
+  assert.ok(await fs.access(path.join(dryHome, "projects", "dry-gone")).then(() => true, () => false), "dry run never moves or deletes anything");
+  const dryRegistryAfter = JSON.parse(await fs.readFile(dryRegistryFile, "utf8"));
+  assert.ok(Object.hasOwn(dryRegistryAfter, "dry-gone"), "dry run never rewrites the registry");
+}
+
+// ---------------------------------------------------------------------------
+// 14b. lib/maintain.js's runMaintenance wiring for cleanupProjects: the
+//      sweep's own "run: ..., cleaned N" summary line and
+//      readMaintenanceSummary's lastCleanupAt/counts7d.cleaned both come
+//      from the exact same cleanupProjectsStep this plugin's own daily
+//      gate reads back.
+// ---------------------------------------------------------------------------
+{
+  const runRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "cleanup-run-maintenance-"));
+  const runHome = path.join(runRoot, "homunculus");
+  const runProject = { project_dir: path.join(runRoot, "project"), root: path.join(runRoot, "project"), id: "run-proj", instincts_personal: path.join(runRoot, "project", "instincts", "personal"), evolved_dir: path.join(runRoot, "project", "evolved") };
+  await fs.mkdir(runProject.instincts_personal, { recursive: true });
+
+  const staleRoot = path.join(TEMP_ROOT, "cleanup-run-maintenance-stale-root");
+  await fs.mkdir(staleRoot, { recursive: true });
+  await fs.mkdir(path.join(runHome, "projects", "stale-under-temp", "instincts", "personal"), { recursive: true });
+  const now = new Date().toISOString();
+  await fs.mkdir(runHome, { recursive: true });
+  await fs.writeFile(path.join(runHome, "projects.json"), JSON.stringify({ "stale-under-temp": { id: "stale-under-temp", name: "stale", root: staleRoot, remote: "", created_at: now, last_seen: now } }), "utf8");
+
+  const counts = await runMaintenance({ dataDir: runHome }, runProject, { ...MAINTENANCE_DEFAULTS, promote: false, prune: false, decay: false, dedupe: false, evolve: false, repair: false });
+  assert.equal(counts.cleaned, 1, "runMaintenance's own counts include cleanupProjects' result");
+
+  const logContent = await fs.readFile(path.join(runProject.project_dir, "maintenance.log"), "utf8");
+  assert.ok(/run: promoted 0, archived 0, merged 0, pruned 0, candidates 0, repaired 0, cleaned 1/.test(logContent), `run summary line carries 'cleaned 1': ${logContent}`);
+
+  const { readMaintenanceSummary } = await import("./lib/maintain.js");
+  const summary = await readMaintenanceSummary(runProject);
+  assert.ok(typeof summary.lastCleanupAt === "string" && !Number.isNaN(Date.parse(summary.lastCleanupAt)), "lastCleanupAt is tracked for the daily gate");
+  assert.equal(summary.counts7d.cleaned, 1, "the 7-day rollup counts the cleaned project too");
 }
 
 // ---------------------------------------------------------------------------
