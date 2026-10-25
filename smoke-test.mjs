@@ -40,6 +40,13 @@ import {
 } from "./lib/candidates.js";
 import { bumpUsage, commandNameFromPromptText, readUsage } from "./lib/usage.js";
 import { registerCommands } from "./lib/commands.js";
+import {
+  REVIEW_DEFAULTS,
+  buildReviewPermissions,
+  buildReviewPrompt,
+  createReviewController,
+  readReviewGate,
+} from "./lib/review.js";
 
 // os.tmpdir() resolves under /private/var/folders in the sandboxes this
 // plugin is developed in; nesting under opencode/instincts-test keeps every
@@ -85,6 +92,7 @@ function createPluginHarness(directory, options) {
   const toolDefs = [];
   const syntheticCalls = [];
   const promptCalls = [];
+  const createCalls = [];
 
   const makeRegistration = () => {
     const registration = { disposed: false, dispose: async () => { registration.disposed = true; } };
@@ -118,6 +126,17 @@ function createPluginHarness(directory, options) {
         promptCalls.push(input);
         return {};
       },
+      // lib/review.js's controller only ever reaches these once a review
+      // is actually due; every full-plugin test below keeps review either
+      // disabled or pointed at an empty observationsRoot, so these exist
+      // only so a real host-shaped ctx.session is here if that ever did
+      // fire, rather than throwing "create is not a function".
+      create: async (input) => {
+        createCalls.push(input);
+        return { id: "ses_fake-review" };
+      },
+      get: async () => null,
+      interrupt: async () => ({ interrupted: true }),
     },
     command: {
       transform: async (fn) => {
@@ -131,6 +150,9 @@ function createPluginHarness(directory, options) {
       // generate.text.
       text: async () => ({ text: "<none/>" }),
     },
+    // No event bridge in this harness: lib/review.js's controller falls
+    // back to polling ctx.session.get, which is harmless here since the
+    // same fixtures below never let a review actually spawn.
   };
 
   const composeHook = (name) => {
@@ -149,7 +171,51 @@ function createPluginHarness(directory, options) {
     },
   };
 
-  return { ctx, registrations, toolHooks, sessionHooks, sessionHookLists, commandDefs, toolDefs, syntheticCalls, promptCalls };
+  return { ctx, registrations, toolHooks, sessionHooks, sessionHookLists, commandDefs, toolDefs, syntheticCalls, promptCalls, createCalls };
+}
+
+// Minimal pushable async event bus for lib/review.js's controller tests:
+// stands in for a real host's ctx.event.subscribe({signal}) async
+// iterable. push() feeds one event to whichever `next()` call is
+// currently pending (or queues it if none is), mirroring how a real
+// event stream delivers events whenever they occur, not on a fixed
+// schedule.
+function createFakeEventBus() {
+  const waiters = [];
+  const queue = [];
+  return {
+    push(event) {
+      if (waiters.length > 0) waiters.shift()(event);
+      else queue.push(event);
+    },
+    subscribe() {
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false });
+              return new Promise((resolve) => waiters.push((event) => resolve({ value: event, done: false })));
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+// Polls `predicate` until it is true or `timeoutMs` elapses: the
+// controller's own completion handling runs through a background
+// ctx.event.subscribe consumer loop plus several real fs.promises calls,
+// so a fixed-length sleep would either be flaky (too short) or slow the
+// suite down for no reason (padded long); polling a concrete condition
+// is both faster and deterministic.
+async function waitFor(predicate, { timeoutMs = 2000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await predicate()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 // Builds a minimal SessionContext-shaped event (@opencode/plugin's
@@ -209,8 +275,9 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       "instinct-prune",
       "instinct-status",
       "promote",
+      "skill-review",
     ].sort(),
-    "all fourteen slash commands registered",
+    "all fifteen slash commands registered",
   );
   assert.equal(harness.toolDefs.length, 1, "one tool registered");
   assert.equal(harness.toolDefs[0].id, "instincts", "tool id is instincts");
@@ -3514,6 +3581,271 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const stillInstalled = await findCandidateById(deadProject.evolved_dir, "dead-signal-cand");
   assert.equal(stillInstalled.fields.status, "installed");
   await fs.access(deadInstallPath); // never removed
+}
+
+// ---------------------------------------------------------------------------
+// 20. lib/review.js's readReviewGate: due/not-due decisions over the
+//     task-observer workspace's own open-observation count, last review
+//     date, lock file, and runs log, checked in the priority order
+//     readReviewGate itself documents (open count, then cadence, then
+//     lock, then cooldown).
+// ---------------------------------------------------------------------------
+{
+  const gateCfg = { ...REVIEW_DEFAULTS, cadenceDays: 7, cooldownHours: 24, timeoutMinutes: 90 };
+
+  // Never reviewed, 3 open -> due.
+  const dueRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-gate-due-"));
+  const dueLogDir = path.join(dueRoot, "skill-observations", "observation-log");
+  await fs.mkdir(dueLogDir, { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    await fs.writeFile(path.join(dueLogDir, `000${i}-open.md`), "---\nstatus: open\n---\nbody\n", "utf8");
+  }
+  const dueGate = await readReviewGate(dueRoot, gateCfg);
+  assert.equal(dueGate.due, true, "never reviewed with 3 open observations is due");
+  assert.equal(dueGate.open, 3);
+  assert.equal(dueGate.lastReview, null);
+
+  // Reviewed today -> not due, reason names the cadence.
+  await fs.writeFile(path.join(dueRoot, "skill-observations", "last-review-date.txt"), `${new Date().toISOString().slice(0, 10)}\n`, "utf8");
+  const freshGate = await readReviewGate(dueRoot, gateCfg);
+  assert.equal(freshGate.due, false);
+  assert.ok(freshGate.reason.includes("cadence"), `reason should name the cadence: ${freshGate.reason}`);
+
+  // 0 open -> not due.
+  const emptyRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-gate-empty-"));
+  await fs.mkdir(path.join(emptyRoot, "skill-observations", "observation-log"), { recursive: true });
+  const emptyGate = await readReviewGate(emptyRoot, gateCfg);
+  assert.equal(emptyGate.due, false);
+  assert.equal(emptyGate.open, 0);
+  assert.equal(emptyGate.reason, "no open observations");
+
+  // Live lock (fresh startedAt) -> not due, reason names the lock.
+  const lockRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-gate-lock-"));
+  const lockLogDir = path.join(lockRoot, "skill-observations", "observation-log");
+  await fs.mkdir(lockLogDir, { recursive: true });
+  await fs.writeFile(path.join(lockLogDir, "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+  const lockStateDir = path.join(lockRoot, "skill-observations", ".mighty-instincts");
+  await fs.mkdir(lockStateDir, { recursive: true });
+  await fs.writeFile(
+    path.join(lockStateDir, "review-lock.json"),
+    JSON.stringify({ startedAt: new Date().toISOString(), sessionID: "ses_abc", pid: 123, host: "test-host" }),
+    "utf8",
+  );
+  const liveLockGate = await readReviewGate(lockRoot, gateCfg);
+  assert.equal(liveLockGate.due, false);
+  assert.ok(liveLockGate.reason.includes("locked"), `reason should name the lock: ${liveLockGate.reason}`);
+  assert.equal(liveLockGate.lock?.sessionID, "ses_abc");
+
+  // The same lock, but with a startedAt older than timeoutMinutes -> due
+  // again (stale, no longer reported as live).
+  await fs.writeFile(
+    path.join(lockStateDir, "review-lock.json"),
+    JSON.stringify({ startedAt: new Date(Date.now() - 200 * 60000).toISOString(), sessionID: "ses_old", pid: 123, host: "test-host" }),
+    "utf8",
+  );
+  const staleLockGate = await readReviewGate(lockRoot, gateCfg);
+  assert.equal(staleLockGate.due, true, "a lock older than timeoutMinutes no longer blocks the gate");
+  assert.equal(staleLockGate.lock, null, "a stale lock is not reported as live");
+
+  // Cooldown: a "started" runs-log line 1h ago, cooldownHours 24 -> not due.
+  const cooldownRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-gate-cooldown-"));
+  const cooldownLogDir = path.join(cooldownRoot, "skill-observations", "observation-log");
+  await fs.mkdir(cooldownLogDir, { recursive: true });
+  await fs.writeFile(path.join(cooldownLogDir, "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+  const cooldownStateDir = path.join(cooldownRoot, "skill-observations", ".mighty-instincts");
+  await fs.mkdir(cooldownStateDir, { recursive: true });
+  const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+  await fs.writeFile(path.join(cooldownStateDir, "review-runs.log"), `${oneHourAgo} started session ses_recent\n`, "utf8");
+  const cooldownGate = await readReviewGate(cooldownRoot, gateCfg);
+  assert.equal(cooldownGate.due, false);
+  assert.ok(cooldownGate.reason.includes("cooldown"), `reason should name the cooldown: ${cooldownGate.reason}`);
+}
+
+// ---------------------------------------------------------------------------
+// 21. lib/review.js's buildReviewPrompt: the autonomous-review instructions
+//     name the pinned workspace root, the bounded slice size, today's
+//     date, and the guardrails a headless, unattended session needs
+//     (never ask a question, where last-review-date.txt lives, where
+//     staged skill changes land).
+// ---------------------------------------------------------------------------
+{
+  const promptRoot = path.join(TEMP_ROOT, "review-prompt-root");
+  const promptDate = "2026-10-25";
+  const prompt = buildReviewPrompt({ root: promptRoot, sliceSize: 10, date: promptDate });
+  assert.ok(prompt.includes(promptRoot), "prompt names the pinned workspace root");
+  assert.ok(prompt.includes("10 oldest OPEN observations"), "prompt names the slice size");
+  assert.ok(prompt.includes(promptDate), "prompt names today's date");
+  assert.ok(prompt.includes("never ask a question"), "prompt forbids asking a question");
+  assert.ok(prompt.includes("last-review-date.txt"), "prompt names the last-review-date file");
+  assert.ok(prompt.includes("skill-updates"), "prompt names the staging directory");
+}
+
+// ---------------------------------------------------------------------------
+// 22. lib/review.js's buildReviewPermissions: edits are denied everywhere
+//     except inside the workspace root, external directory reads are
+//     denied everywhere except the workspace root plus the caller-supplied
+//     skills/external directories, and shell is allowed outright (the
+//     review procedure runs bash snippets in a headless session that
+//     cannot answer an ask prompt).
+// ---------------------------------------------------------------------------
+{
+  const permRoot = path.join(TEMP_ROOT, "review-permissions-root");
+  const rules = buildReviewPermissions({ root: permRoot, externalDirectories: ["/opt/extra"], skillsDirs: ["/Users/x/.config/opencode"] });
+
+  const editRules = rules.filter((rule) => rule.action === "edit");
+  assert.equal(editRules[0].resource, "*");
+  assert.equal(editRules[0].effect, "deny");
+  const editAllow = editRules.find((rule) => rule.effect === "allow" && rule.resource === `${permRoot}/*`);
+  assert.ok(editAllow, "a later edit rule allows <root>/*");
+  assert.ok(rules.indexOf(editRules[0]) < rules.indexOf(editAllow), "the root allow comes after the deny (last-match-wins)");
+
+  const externalRules = rules.filter((rule) => rule.action === "external_directory");
+  assert.equal(externalRules[0].resource, "*");
+  assert.equal(externalRules[0].effect, "deny");
+  assert.equal(rules.indexOf(externalRules[0]), rules.findIndex((rule) => rule.action === "external_directory"), "deny * is the first external_directory rule");
+  assert.ok(externalRules.some((rule) => rule.effect === "allow" && rule.resource === `${permRoot}/*`));
+  assert.ok(externalRules.some((rule) => rule.effect === "allow" && rule.resource === "/opt/extra/*"));
+  assert.ok(externalRules.some((rule) => rule.effect === "allow" && rule.resource === "/Users/x/.config/opencode/*"));
+
+  assert.deepEqual(rules.filter((rule) => rule.action === "shell"), [{ action: "shell", resource: "*", effect: "allow" }]);
+}
+
+// ---------------------------------------------------------------------------
+// 23. lib/review.js's createReviewController, against a fake ctx: a forced
+//     run spawns exactly one session, writes the lock and the "started"
+//     runs-log line, a second forced run while that lock is live spawns
+//     nothing further, and a simulated session-idle event (delivered
+//     through the same ctx.event.subscribe bridge the controller itself
+//     subscribes to) releases the lock, logs "finished ... completed",
+//     and calls the afterRun hook exactly once.
+// ---------------------------------------------------------------------------
+{
+  const reviewRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-controller-"));
+  await fs.mkdir(path.join(reviewRoot, "skill-observations", "observation-log"), { recursive: true });
+  await fs.writeFile(path.join(reviewRoot, "skill-observations", "observation-log", "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+
+  const eventBus = createFakeEventBus();
+  const createCalls = [];
+  const promptCalls = [];
+  let afterRunCalls = 0;
+
+  const fakeCtx = {
+    event: { subscribe: () => eventBus.subscribe() },
+    session: {
+      create: async (input) => {
+        createCalls.push(input);
+        return { id: "ses_review1" };
+      },
+      prompt: async (input) => {
+        promptCalls.push(input);
+        return {};
+      },
+      synthetic: async () => ({}),
+      get: async () => {
+        throw new Error("session.get should not be polled while the event bridge is available");
+      },
+      interrupt: async () => ({}),
+    },
+  };
+
+  const reviewOptions = { board: { observationsRoot: reviewRoot }, review: { ...REVIEW_DEFAULTS, enabled: false } };
+  const controller = createReviewController(fakeCtx, reviewOptions, {
+    afterRun: async () => {
+      afterRunCalls += 1;
+    },
+  });
+
+  const firstRun = await controller.run({ force: true });
+  assert.equal(firstRun.spawned, true);
+  assert.equal(firstRun.sessionID, "ses_review1");
+  assert.equal(createCalls.length, 1, "exactly one session.create call");
+  assert.equal(promptCalls.length, 1, "exactly one session.prompt call");
+  assert.equal(
+    promptCalls[0].text,
+    buildReviewPrompt({ root: reviewRoot, sliceSize: REVIEW_DEFAULTS.sliceSize, date: new Date().toISOString().slice(0, 10) }),
+    "the prompt sent matches buildReviewPrompt's own output",
+  );
+
+  const lockPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-lock.json");
+  const lockContent = JSON.parse(await fs.readFile(lockPath, "utf8"));
+  assert.equal(lockContent.sessionID, "ses_review1");
+
+  const runsLogPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-runs.log");
+  const runsLogAfterStart = await fs.readFile(runsLogPath, "utf8");
+  assert.ok(runsLogAfterStart.includes("started session ses_review1"));
+
+  // A second forced run while the lock is live spawns nothing further.
+  const secondRun = await controller.run({ force: true });
+  assert.equal(secondRun.spawned, false);
+  assert.equal(createCalls.length, 1, "still exactly one session.create call");
+
+  // Simulate the review session finishing: the test writes
+  // last-review-date.txt itself (standing in for the real session's own
+  // Step 7 write), then pushes the same idle-shaped event the
+  // controller's own ctx.event.subscribe bridge is listening for.
+  const today = new Date().toISOString().slice(0, 10);
+  await fs.writeFile(path.join(reviewRoot, "skill-observations", "last-review-date.txt"), `${today}\n`, "utf8");
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review1" } });
+
+  const lockRemoved = await waitFor(async () => {
+    try {
+      await fs.access(lockPath);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  assert.ok(lockRemoved, "the lock file is removed once the idle event is processed");
+
+  const runsLogAfterFinish = await fs.readFile(runsLogPath, "utf8");
+  assert.ok(runsLogAfterFinish.includes(`finished session ses_review1: completed, last-review-date now ${today}`));
+  assert.equal(afterRunCalls, 1, "afterRun is called exactly once after the review finishes");
+
+  controller.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 24. Plugin-level wiring (lib/plugin.js): /skill-review registers
+//     regardless of review.enabled, a disabled (default) review never
+//     calls ctx.session.create on its own, and turning review.enabled on
+//     does not throw during setup (its real startup timer is left
+//     untested here: see lib/review.js's own controller tests above for
+//     the actual spawn/completion behaviour).
+// ---------------------------------------------------------------------------
+{
+  const { projectDir, dataDir } = makeProjectAndData("review-plugin");
+  // An observationsRoot that is never created keeps readReviewGate's
+  // "no open observations" branch true even if the real
+  // startupDelaySeconds timer below ever did fire before cleanup runs.
+  const missingObservationsRoot = path.join(TEMP_ROOT, "review-plugin-missing-root");
+
+  const disabledOptions = {
+    python: "python3",
+    dataDir,
+    board: { enabled: false, observationsRoot: missingObservationsRoot },
+  };
+  const disabledHarness = createPluginHarness(projectDir, disabledOptions);
+  const disabledCleanup = await setup(disabledHarness.ctx);
+  assert.ok(disabledHarness.commandDefs.some((def) => def.name === "skill-review"), "/skill-review registers even when review.enabled is false (its default)");
+  assert.equal(disabledHarness.createCalls.length, 0, "a disabled review controller never calls ctx.session.create on setup/start");
+  await disabledCleanup();
+
+  const { projectDir: enabledProjectDir, dataDir: enabledDataDir } = makeProjectAndData("review-plugin-enabled");
+  const enabledOptions = {
+    python: "python3",
+    dataDir: enabledDataDir,
+    board: { enabled: false, observationsRoot: missingObservationsRoot },
+    review: { enabled: true, startupDelaySeconds: 0, pollMinutes: 60 },
+  };
+  const enabledHarness = createPluginHarness(enabledProjectDir, enabledOptions);
+  // Only asserts that enabling review does not throw during setup; the
+  // real startupDelaySeconds timer is not awaited (no real-timer waits in
+  // this test), so whether it has fired yet by the time cleanup() runs
+  // below is intentionally left unobserved.
+  const enabledCleanup = await setup(enabledHarness.ctx);
+  assert.equal(typeof enabledCleanup, "function", "setup still returns a cleanup function with review.enabled: true");
+  assert.ok(enabledHarness.commandDefs.some((def) => def.name === "skill-review"));
+  await enabledCleanup();
 }
 
 function buildFakeObserverOutput() {
