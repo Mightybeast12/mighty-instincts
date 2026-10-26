@@ -1326,7 +1326,10 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(richSummary.includes("run-tests-first (1x): Run the test suite before pushing."), "every fired-today habit is listed, not just the first");
   assert.ok(richSummary.includes("Next learning run ready. 3 ready: /promote."), "nextRunReady reads as 'ready', and the /promote hint rides the same line once readyToShare is positive");
   assert.ok(richSummary.includes("398 open, 158 this week, never reviewed."), "Skill notes stays a single headline line");
-  assert.ok(richSummary.includes("last measured 2d ago, 92% with the skill vs 8% without."), "Skill test stays a single headline line");
+  assert.ok(
+    richSummary.includes("the skill lifts the pass rate from 8% without to 92% with it, 2d ago."),
+    "Skill test names the comparison (with vs without) and the verdict (improved), not just the two raw percentages",
+  );
   assert.ok(!/[\u2014\u2013]/.test(richSummary), "/board text never contains an em or en dash");
 
   const noHabitsToday = formatBoardSummary({ ...richState, instincts: { ...richState.instincts, firedTodayTop: [] } }, {});
@@ -1369,14 +1372,67 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const overdueSummary = formatBoardSummary({ ...richState, observations: { ...richState.observations, open: 467, added7d: 167, warning: true } }, {});
   assert.ok(overdueSummary.includes("467 open, 167 this week, never reviewed: review overdue."), "the warning flag appends ': review overdue' to the same headline line");
 
-  // Skill test: "no measurable difference" (and a stale, not active,
-  // glyph) once |with - baseline| < 0.05, even though the benchmark
-  // itself is fresh.
+  // Skill test: both runs at the ceiling reads "saturated" (not just "no
+  // change"), a stale glyph, and names what was compared (with vs
+  // without) and why the near-zero difference does not mean the skill
+  // did nothing: the evals themselves cannot separate the two runs.
   const noDifferenceSummary = formatBoardSummary(
     { ...richState, evals: { ...richState.evals, withSkill: 1, baseline: 1, timestamp: new Date(Date.now() - 4 * 86400000).toISOString() } },
     {},
   );
-  assert.ok(noDifferenceSummary.includes("\u25cb Skill test (pr)  no measurable difference last run (100% vs 100%, 4d ago)."), "a near-zero difference reads 'no measurable difference' with a stale (hollow) glyph, matching the target format exactly");
+  assert.ok(
+    noDifferenceSummary.includes("\u25cb Skill test (pr)  100% both with and without the skill: the evals cannot tell them apart, 4d ago. Add harder cases."),
+    "both runs at the ceiling reads 'saturated' with a stale (hollow) glyph, matching the target format exactly",
+  );
+
+  // Skill test: the same "both at the ceiling" scenario, but for
+  // skill-creator's "old_skill" naming (comparing the same skill against
+  // its own previous version, not with/without it): "old and new both
+  // pass", and the glyph stays stale no matter how old the benchmark is.
+  const saturatedOldVsNew = formatBoardSummary(
+    { ...richState, evals: { ...richState.evals, baselineKind: "old", withSkill: 1, baseline: 1, timestamp: new Date(Date.now() - 8 * 86400000).toISOString() } },
+    {},
+  );
+  assert.ok(
+    saturatedOldVsNew.includes("the last edit changed nothing the evals can see: old and new both pass 100%, 8d ago. The evals are saturated; add harder cases."),
+    "old vs new, both at the ceiling: 'saturated', naming that this benchmark compares old and new versions of the same skill",
+  );
+
+  // Skill test: old vs new, a real rise (not saturated, not just inside
+  // the no-change band): 'improved', and an active (solid) glyph while
+  // the benchmark is still fresh.
+  const improvedOldVsNew = formatBoardSummary(
+    { ...richState, evals: { ...richState.evals, baselineKind: "old", withSkill: 1, baseline: 0.67, timestamp: new Date(Date.now() - 1 * 86400000).toISOString() } },
+    {},
+  );
+  assert.ok(
+    improvedOldVsNew.includes("\u25cf Skill test (pr)  the last edit raised the pass rate from 67% (old) to 100% (new), 1d ago."),
+    "old vs new, a real rise: 'improved', with an active glyph while fresh",
+  );
+
+  // Skill test: with vs without, a near-zero difference that is not at
+  // the ceiling: 'no change', distinct wording (and reasoning) from
+  // 'saturated'.
+  const noChangeWithVsWithout = formatBoardSummary(
+    { ...richState, evals: { ...richState.evals, withSkill: 0.5, baseline: 0.5, timestamp: new Date().toISOString() } },
+    {},
+  );
+  assert.ok(
+    noChangeWithVsWithout.includes("the skill makes no measurable difference: 50% with it, 50% without,"),
+    "with vs without, a near-zero (not at the ceiling) difference reads 'no change', not 'saturated'",
+  );
+
+  // Skill test: with vs without, a real drop: 'worse', and a stale glyph
+  // even though the benchmark itself is fresh (only a fresh 'improved'
+  // ever reads active).
+  const worseWithVsWithout = formatBoardSummary(
+    { ...richState, evals: { ...richState.evals, withSkill: 0.83, baseline: 1, timestamp: new Date(Date.now() - 1 * 86400000).toISOString() } },
+    {},
+  );
+  assert.ok(
+    worseWithVsWithout.includes("\u25cb Skill test (pr)  the skill lowers the pass rate from 100% without to 83% with it, 1d ago."),
+    "with vs without, a real drop: 'worse', with a stale glyph even though the benchmark itself is fresh",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,6 +1660,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(evalsNone.label, "Skill test", "no eval data at all reads as the bare label");
   assert.equal(evalsNone.glyph, "stale");
   assert.equal(evalsNone.headline, "none");
+  assert.equal(evalsNone.verdict, null, "nothing to compare: no verdict");
 
   const evalsNoSkillName = buildEvalsBlock({ available: true, skill: null, withSkill: 0.9, baseline: 0.1, timestamp: new Date().toISOString() });
   assert.equal(evalsNoSkillName.label, "Skill test", "available data with no skill name on record still reads as the bare label");
@@ -1612,13 +1669,15 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const evalsFresh = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date(Date.now() - 2 * 86400000).toISOString() });
   assert.equal(evalsFresh.label, "Skill test (pr)");
   assert.equal(evalsFresh.glyph, "active", "a benchmark under 7 days old reads active");
-  assert.deepEqual(evalsFresh.rows, [{ label: "with skill", value: "92%" }, { label: "without", value: "8%" }]);
+  assert.equal(evalsFresh.comparison, "with vs without");
+  assert.deepEqual(evalsFresh.rows, [{ label: "with skill", value: "92%" }, { label: "without", value: "8%" }, { label: "verdict", value: "improved" }], "the verdict row always comes after both percentage rows");
 
   const evalsStale = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date(Date.now() - 9 * 86400000).toISOString() });
   assert.equal(evalsStale.glyph, "stale", "a benchmark over 7 days old reads stale");
 
   const evalsOldNaming = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "old", timestamp: new Date().toISOString() });
-  assert.deepEqual(evalsOldNaming.rows, [{ label: "new", value: "92%" }, { label: "old", value: "8%" }], "the 'old_skill' naming reads 'new'/'old' instead of 'with skill'/'without'");
+  assert.equal(evalsOldNaming.comparison, "old vs new", "the 'old_skill' naming reads as the 'old vs new' comparison");
+  assert.deepEqual(evalsOldNaming.rows, [{ label: "new", value: "92%" }, { label: "old", value: "8%" }, { label: "verdict", value: "improved" }], "the 'old_skill' naming reads 'new'/'old' instead of 'with skill'/'without', and still carries the verdict row");
 
   // --- buildEvalsBlock: "no measurable difference" (|with - baseline| <
   //     0.05) reads stale even though the benchmark itself is fresh, and
@@ -1627,18 +1686,23 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const evalsNoDifference = buildEvalsBlock({ available: true, skill: "pr", withSkill: 1, baseline: 1, baselineKind: "without", timestamp: new Date(Date.now() - 4 * 86400000).toISOString() });
   assert.equal(evalsNoDifference.glyph, "stale", "a fresh benchmark with no measurable difference still reads stale");
   assert.equal(evalsNoDifference.noMeasurableDifference, true);
+  assert.equal(evalsNoDifference.verdict, "saturated", "both runs at the ceiling: verdict is 'saturated', not just 'no change'");
 
   const evalsSmallPositive = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.52, baseline: 0.5, baselineKind: "without", timestamp: new Date().toISOString() });
   assert.equal(evalsSmallPositive.noMeasurableDifference, true, "a +0.02 difference is still inside the 0.05 'no measurable difference' band");
   assert.equal(evalsSmallPositive.glyph, "stale");
+  assert.equal(evalsSmallPositive.verdict, "no change", "a small difference that is not at the ceiling: 'no change', not 'saturated'");
 
   const evalsRegression = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.4, baseline: 0.8, baselineKind: "without", timestamp: new Date().toISOString() });
   assert.equal(evalsRegression.glyph, "stale", "a large negative difference (the skill measured worse) reads stale too, not just the near-zero band");
   assert.equal(evalsRegression.noMeasurableDifference, false, "a large regression is not worded as 'no measurable difference'; it is just stale");
+  assert.equal(evalsRegression.verdict, "worse");
 
   const evalsRealImprovement = buildEvalsBlock({ available: true, skill: "pr", withSkill: 0.92, baseline: 0.08, baselineKind: "without", timestamp: new Date().toISOString() });
   assert.equal(evalsRealImprovement.glyph, "active", "a real, fresh improvement still reads active");
   assert.equal(evalsRealImprovement.noMeasurableDifference, false);
+  assert.equal(evalsRealImprovement.verdict, "improved");
+  assert.deepEqual(evalsRealImprovement.rows.map((row) => row.label), ["with skill", "without", "verdict"], "the verdict row always comes after both percentage rows");
 
   // --- shared glyph/legend constants ------------------------------------
   assert.deepEqual(GLYPH_CHAR, { active: "\u25cf", attention: "\u25cf", stale: "\u25cb" });
