@@ -1,6 +1,6 @@
 {
   "name": "mighty-instincts",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "OpenCode V2 plugin that observes session activity and distils it into ECC-compatible instincts, exposes the ECC instinct CLI as slash commands, and (OpenCode 2 TUI) shows a collapsible sidebar board summarising instincts, observations and skill evals.",
   "type": "module",
   "main": "index.js",
