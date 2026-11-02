@@ -898,7 +898,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   // match for the target, so a green below comes from the update being
   // recognised as an update, not from the pair failing to overlap.
   assert.equal(
-    await dedupeOrMerge(project.instincts_personal, { ...sourceFields, id: "brand-new-id", summary: "Stage explicit paths and commit from a message file." }, "", { dryRun: true }),
+    await dedupeOrMerge(project.instincts_personal, { ...sourceFields, id: "brand-new-id", summary: "Stage explicit paths and commit from a message file." }, backfillResponse.split("\n---\n")[2].replace("</instinct>", ""), { dryRun: true }),
     true,
     "control: a new id with the source's fields would merge into the target",
   );
@@ -2728,13 +2728,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await writeInstinct(
     dedupeProject,
     { id: "existing-habit", trigger: "grep before editing unfamiliar repository files", confidence: 0.6, domain: "workflow", summary: "Grep before editing unfamiliar files.", created: new Date().toISOString() },
-    "# Existing\n\n## Action\nGrep first.\n\n## Evidence\n- Observed 3 times\n",
+    "# Existing\n\n## Action\nSearch the repository with grep before editing unfamiliar files.\n\n## Evidence\n- Observed 3 times\n",
   );
   const dedupeLog = [];
   const merged = await dedupeOrMerge(
     dedupeProject,
     { id: "new-habit", trigger: "grep before editing unfamiliar repository code", confidence: 0.7, summary: "Grep." },
-    "# New\n\n## Action\nGrep.\n\n## Evidence\n- Observed 2 more times\n",
+    "# New\n\n## Action\nSearch with grep before editing unfamiliar repository code.\n\n## Evidence\n- Observed 2 more times\n",
     { log: (line) => dedupeLog.push(line) },
   );
   assert.equal(merged, true, "overlapping trigger+summary merges into the existing instinct instead of writing a new file");
@@ -2751,12 +2751,12 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   //     60% to 45% on either field --------------------------------------
   const domainBonusDir = path.join(maintRoot, "proj-dedupe-domain", "instincts", "personal");
   await fs.mkdir(domainBonusDir, { recursive: true });
-  await writeInstinct(domainBonusDir, { id: "zeta-existing", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta\n");
+  await writeInstinct(domainBonusDir, { id: "zeta-existing", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta\n\n## Action\nZephyr quartz falcon meadow.\n");
   const domainBonusLog = [];
   const mergedSameDomain = await dedupeOrMerge(
     domainBonusDir,
     { id: "zeta-same-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "alpha-domain", summary: "Do the same-domain thing." },
-    "# Same domain\n",
+    "# Same domain\n\n## Action\nZephyr quartz falcon basalt.\n",
     { log: (line) => domainBonusLog.push(line) },
   );
   assert.equal(mergedSameDomain, true, "50% trigger overlap alone would not qualify (< 60%), but the same-domain bonus (>= 45%) does");
@@ -2769,11 +2769,11 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   const diffDomainDir = path.join(maintRoot, "proj-dedupe-domain-diff", "instincts", "personal");
   await fs.mkdir(diffDomainDir, { recursive: true });
-  await writeInstinct(diffDomainDir, { id: "zeta-existing-2", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta 2\n");
+  await writeInstinct(diffDomainDir, { id: "zeta-existing-2", trigger: "zephyr quartz falcon meadow cobalt lumen", confidence: 0.6, domain: "alpha-domain" }, "# Zeta 2\n\n## Action\nZephyr quartz falcon meadow.\n");
   const notMergedDiffDomain = await dedupeOrMerge(
     diffDomainDir,
     { id: "zeta-diff-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "beta-domain" },
-    "# Diff domain\n",
+    "# Diff domain\n\n## Action\nZephyr quartz falcon basalt.\n",
     { log: () => {} },
   );
   assert.equal(notMergedDiffDomain, false, "the same 50% overlap does not qualify without a shared domain (below the plain 60% threshold)");
@@ -2794,7 +2794,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       summary: "Rerun the smoke test suite after each edit batch.",
       created: new Date().toISOString(),
     },
-    "# Rerun after each batch\n",
+    "# Rerun after each batch\n\n## Action\nRerun the smoke test suite after each batch of edits.\n",
   );
   const smokeDedupeLog = [];
   const mergedFlakeCheck = await dedupeOrMerge(
@@ -2806,7 +2806,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       domain: "testing",
       summary: "Rerun the smoke test suite to check for flaky results.",
     },
-    "# Flake check\n",
+    "# Flake check\n\n## Action\nRerun the smoke test suite to check whether a failure is flaky.\n",
     { log: (line) => smokeDedupeLog.push(line) },
   );
   assert.equal(mergedFlakeCheck, true, "smoke-test-flake-check-load-then-rerun merges into the existing rerun-smoke-test-after-each-edit-batch file");
@@ -2819,7 +2819,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       domain: "testing",
       summary: "Rerun the smoke test suite under node and bun.",
     },
-    "# Run under node and bun\n",
+    "# Run under node and bun\n\n## Action\nRerun the smoke test suite under node and then under bun.\n",
     { log: (line) => smokeDedupeLog.push(line) },
   );
   assert.equal(mergedRunUnderNodeAndBun, true, "smoke-test-run-under-node-and-bun also merges into the same file");
@@ -2830,6 +2830,42 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   );
   assert.ok(smokeDedupeLog.some((line) => line.includes("dedupe: merged smoke-test-flake-check-load-then-rerun into rerun-smoke-test-after-each-edit-batch")));
   assert.ok(smokeDedupeLog.some((line) => line.includes("dedupe: merged smoke-test-run-under-node-and-bun into rerun-smoke-test-after-each-edit-batch")));
+
+  // --- dedupe: a trigger/summary match whose Action is about another
+  //     subject is not merged. Modelled on the 2026-11-02T12:29Z merge of
+  //     a new "search with rg, not grep" habit into "run the pre-commit
+  //     gates": the triggers shared only the project's own words
+  //     (mightyterm, worktree). The control pair, the same habit learned
+  //     twice, still merges. ------------------------------------------------
+  const subjectDir = path.join(maintRoot, "proj-dedupe-subject", "instincts", "personal");
+  await fs.mkdir(subjectDir, { recursive: true });
+  await writeInstinct(
+    subjectDir,
+    { id: "run-pre-commit-gates", trigger: "when a mightyterm lane has finished an item's code and is about to commit it from its worktree slot", confidence: 0.95, domain: "workflow", summary: "Run detekt, lint and the LOC gate before an item commit." },
+    "# Gates\n\n## Action\n\nBefore the item's commit, run the static gates on the slot: detekt with the rerun flag, then Android lint, then the LOC gate, and record each exit code.\n\n## Evidence\n- Gates ran before the commit.\n",
+  );
+  const subjectFile = path.join(subjectDir, "run-pre-commit-gates.md");
+  const subjectBefore = await fs.readFile(subjectFile, "utf8");
+  const rgMerged = await dedupeOrMerge(
+    subjectDir,
+    { id: "search-with-rg-not-grep", trigger: "when searching for a symbol or marker in a mightyterm lane worktree", confidence: 0.7, domain: "workflow", summary: "Search file contents with rg rather than grep." },
+    "# Search with rg\n\n## Action\n\nSearch file contents with ripgrep (rg -n, rg -o, rg -v) rather than grep, for markers, helper usage and plan anchors.\n\n## Evidence\n- rg was used for almost every search.\n",
+    { log: () => {} },
+  );
+  assert.equal(rgMerged, false, "an instinct whose Action is about another subject is not merged, however its trigger overlaps");
+  assert.equal(await fs.readFile(subjectFile, "utf8"), subjectBefore, "the other-subject target is left byte for byte");
+  await writeInstinct(
+    subjectDir,
+    { id: "verify-ssh-host-fingerprint", trigger: "when the app shows a new ssh host key fingerprint on a lane emulator, before accepting it", confidence: 0.6, domain: "testing", summary: "Compare the shown host key fingerprint with the fixture's before accepting." },
+    "# Fingerprint\n\n## Action\n\nCompare the fingerprint the host key dialog shows with ssh-keygen -l of the fixture's host key before tapping accept.\n",
+  );
+  const sameHabitMerged = await dedupeOrMerge(
+    subjectDir,
+    { id: "compare-host-key-fingerprint", trigger: "when a host key fingerprint dialog appears on a lane emulator, before accepting the ssh host", confidence: 0.6, domain: "testing", summary: "Check the dialog's host key fingerprint against the fixture key first." },
+    "# Compare\n\n## Action\n\nRun ssh-keygen -l on the fixture's host key and compare that fingerprint with the dialog's before accepting the host key.\n",
+    { log: () => {} },
+  );
+  assert.equal(sameHabitMerged, true, "control: the same habit learned twice, with Actions about one subject, still merges");
 
   // --- evolve: three overlapping testing-domain instincts propose one
   //     rule candidate (<= 3 members); re-running leaves it alone, and
