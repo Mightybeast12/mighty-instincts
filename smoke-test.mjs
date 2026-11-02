@@ -813,6 +813,89 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
+// 2d. lib/observer.js: a block that re-emits an instinct the personal store
+//     already holds (the missing-summary backfill above is the usual case)
+//     updates that instinct's own file and is never merged into a
+//     near-duplicate. Before this, dedupe ran first and skipped only the
+//     same id, so the backfill of a summary-less instinct was merged into
+//     another instinct; its own file never got its summary, the next run
+//     listed it again, and one store took one merge per run (2602 between
+//     2026-10-21 and 2026-11-02) into two unrelated instincts.
+// ---------------------------------------------------------------------------
+{
+  const { projectDir, dataDir } = makeProjectAndData("backfill-no-merge");
+  const options = {
+    python: "python3",
+    dataDir,
+    observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 5, minObservations: 20, maxAnalysisLines: 300, notify: false },
+    maintenance: { ...MAINTENANCE_DEFAULTS },
+  };
+  const sourceFields = { id: "stage-paths-commit-message", trigger: "when committing finished item work from a lane worktree slot", confidence: 0.7, domain: "workflow" };
+  const backfillResponse = [
+    "<instinct>",
+    "---",
+    `id: ${sourceFields.id}`,
+    `trigger: "${sourceFields.trigger}"`,
+    "confidence: 0.7",
+    "domain: workflow",
+    'summary: "Stage explicit paths and commit from a message file."',
+    "---",
+    "# Stage paths",
+    "",
+    "## Action",
+    "Stage explicit paths and commit from a message file.",
+    "",
+    "## Evidence",
+    "- Re-emitted only to add its summary.",
+    "</instinct>",
+  ].join("\n");
+  const prompts = [];
+  const ctx = {
+    location: { directory: projectDir },
+    generate: {
+      text: async (args) => {
+        prompts.push(args.prompt);
+        return { text: backfillResponse };
+      },
+    },
+    session: { synthetic: async () => ({}) },
+  };
+  const project = await resolveProject(ctx, options);
+  await writeInstinct(project.instincts_personal, sourceFields, "# Stage paths\n\n## Action\nStage explicit paths and commit from a message file.\n\n## Evidence\n- First seen.\n");
+  // A pre-summary instinct, like the real merge target: a different rule
+  // whose trigger shares enough words with the source's to count as a
+  // dedupe match.
+  await writeInstinct(
+    project.instincts_personal,
+    { id: "run-gates-before-commit", trigger: "when a lane has finished item work and is about to commit from its worktree slot", confidence: 0.95, domain: "workflow" },
+    "# Run the gates\n\n## Action\nRun detekt, lint and the LOC gate before the commit.\n\n## Evidence\n- Gates ran before the commit.\n",
+  );
+  const targetFile = path.join(project.instincts_personal, "run-gates-before-commit.md");
+  const targetBefore = await fs.readFile(targetFile, "utf8");
+
+  // Positive control: the same block under a brand-new id IS a dedupe
+  // match for the target, so a green below comes from the update being
+  // recognised as an update, not from the pair failing to overlap.
+  assert.equal(
+    await dedupeOrMerge(project.instincts_personal, { ...sourceFields, id: "brand-new-id", summary: "Stage explicit paths and commit from a message file." }, "", { dryRun: true }),
+    true,
+    "control: a new id with the source's fields would merge into the target",
+  );
+
+  const observer = createObserver(ctx, options);
+  const firstRun = await observer.run("sess-backfill-no-merge", { notify: false });
+  assert.ok(prompts[0].split("## Missing Summaries")[1]?.includes(sourceFields.id), "run 1 asks the model for the summary-less instinct's summary");
+  assert.ok(/1 written/.test(firstRun), `the re-emitted instinct is written to its own file (run said: ${firstRun.split("\n")[0]})`);
+  const sourceAfter = await fs.readFile(path.join(project.instincts_personal, `${sourceFields.id}.md`), "utf8");
+  assert.ok(sourceAfter.includes('summary: "Stage explicit paths and commit from a message file."'), "the backfilled summary lands on the instinct it belongs to");
+  assert.equal(await fs.readFile(targetFile, "utf8"), targetBefore, "the near-duplicate is left byte-for-byte alone: no merge, no new summary, no appended evidence");
+
+  await observer.run("sess-backfill-no-merge", { notify: false });
+  assert.ok(!prompts[1].split("## Missing Summaries")[1]?.includes(sourceFields.id), "run 2 no longer lists the instinct as missing a summary, so nothing re-emits it again");
+  assert.equal(await fs.readFile(targetFile, "utf8"), targetBefore, "the near-duplicate is still untouched after a second run");
+}
+
+// ---------------------------------------------------------------------------
 // 4. project.js: concurrent first resolveProject calls for a directory with
 //    no cache entry yet share one in-flight resolution, i.e. spawn one
 //    python subprocess rather than one per caller. Counted by pointing
@@ -2568,7 +2651,8 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.deepEqual(await fs.readdir(dedupeProject), ["existing-habit.md"], "no new-habit.md was ever written");
   const mergedContent = await fs.readFile(path.join(dedupeProject, "existing-habit.md"), "utf8");
   assert.ok(/confidence:\s*0\.65/.test(mergedContent), "confidence raised by 0.05");
-  assert.ok(mergedContent.includes('summary: "Grep."'), "a shorter new summary replaces the existing (longer) one");
+  assert.ok(mergedContent.includes('summary: "Grep before editing unfamiliar files."'), "a merge keeps the target's own summary: the source's summary describes the source");
+  assert.ok(!mergedContent.includes('summary: "Grep."'), "a shorter source summary never replaces the target's");
   assert.ok(mergedContent.includes("Observed 3 times") && mergedContent.includes("Observed 2 more times"), "the new evidence paragraph is appended to the existing ## Evidence section");
   assert.ok(dedupeLog.some((line) => line.includes("dedupe: merged new-habit into existing-habit")));
 
@@ -2581,13 +2665,17 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const domainBonusLog = [];
   const mergedSameDomain = await dedupeOrMerge(
     domainBonusDir,
-    { id: "zeta-same-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "alpha-domain" },
+    { id: "zeta-same-domain", trigger: "zephyr quartz falcon basalt tundra canyon", confidence: 0.5, domain: "alpha-domain", summary: "Do the same-domain thing." },
     "# Same domain\n",
     { log: (line) => domainBonusLog.push(line) },
   );
   assert.equal(mergedSameDomain, true, "50% trigger overlap alone would not qualify (< 60%), but the same-domain bonus (>= 45%) does");
   assert.deepEqual(await fs.readdir(domainBonusDir), ["zeta-existing.md"], "merged into the existing file; no second file written");
   assert.ok(domainBonusLog.some((line) => line.includes("dedupe: merged zeta-same-domain into zeta-existing")));
+  assert.ok(
+    !(await fs.readFile(path.join(domainBonusDir, "zeta-existing.md"), "utf8")).includes("summary:"),
+    "a target with no summary of its own does not take the source's: the backfill gives it its own",
+  );
 
   const diffDomainDir = path.join(maintRoot, "proj-dedupe-domain-diff", "instincts", "personal");
   await fs.mkdir(diffDomainDir, { recursive: true });
