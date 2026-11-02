@@ -4126,6 +4126,43 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await enabledCleanup();
 }
 
+// ---------------------------------------------------------------------------
+// 25. scripts/release.sh's CI gate reads the run of the commit it pushed.
+//     It read `gh run list --limit 1`, which right after a push is still
+//     the previous commit's run: on 2026-11-02 the 0.9.2 release reported
+//     the 0.9.1 run's success while its own run was failing. A fake `gh`
+//     answers the unfiltered call with an older passing run and the
+//     pushed sha's own call with a failure; the gate must fail. Control:
+//     the same sha passing, the gate passes. The script's last line
+//     (`main "$@"`) is stripped so its functions can be sourced.
+// ---------------------------------------------------------------------------
+{
+  const { spawnSync } = await import("node:child_process");
+  const ghDir = fsSync.mkdtempSync(path.join(TEMP_ROOT, "release-gh-"));
+  const pushedSha = "8a16154e267d97dbbc5525f5346a7f3a398a21f4";
+  const fakeGh = [
+    "#!/usr/bin/env bash",
+    'args="$*"',
+    `if [[ "$args" == *"--commit ${pushedSha}"* ]]; then`,
+    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"${FAKE_PUSHED_CONCLUSION}\\",\\"url\\":\\"https://ci/pushed\\"}]"',
+    "else",
+    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"success\\",\\"url\\":\\"https://ci/previous\\"}]"',
+    "fi",
+  ].join("\n");
+  fsSync.writeFileSync(path.join(ghDir, "gh"), `${fakeGh}\n`, { mode: 0o755 });
+  const releaseScript = path.join(path.dirname(new URL(import.meta.url).pathname), "scripts", "release.sh");
+  const runGate = (conclusion) =>
+    spawnSync("bash", ["-c", `source <(sed '$d' "$1"); NODE_BIN="$2"; gate_wait_for_ci "$3"`, "gate", releaseScript, process.execPath, pushedSha], {
+      env: { ...process.env, PATH: `${ghDir}:${process.env.PATH}`, FAKE_PUSHED_CONCLUSION: conclusion },
+      encoding: "utf8",
+    });
+  const failing = runGate("failure");
+  assert.notEqual(failing.status, 0, `the CI gate fails when the pushed commit's own run failed (gate said: ${failing.stdout}${failing.stderr})`);
+  assert.ok(`${failing.stdout}${failing.stderr}`.includes("https://ci/pushed"), "the gate reports the pushed commit's run, not the previous one");
+  const passing = runGate("success");
+  assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
+}
+
 function buildFakeObserverOutput() {
   const valid = `---
 id: prefer-functional-components
