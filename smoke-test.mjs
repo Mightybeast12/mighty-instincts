@@ -768,10 +768,15 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
-// 2c. lib/observer.js's missing-summary backfill: an existing personal
-//     instinct with no `summary:` field gets listed in the next observer
-//     run's prompt (a "## Missing Summaries" section), even with zero new
-//     observations, instructing the model to add only a summary.
+// 2c. lib/observer.js never lets the model replace a stored body it was
+//     never shown. A summary-less personal instinct gets its summary from
+//     its own Action, without a model call, and keeps its body. A block
+//     the model returns for an id that already has a file (an update)
+//     keeps the stored body and only appends the block's evidence, and the
+//     file keeps its own created:, fired: and decayed_at:. Before this,
+//     the prompt asked the model to "keep ... body exactly as given"
+//     without giving it, and the reply replaced the whole file: 72
+//     re-emitted blocks wrote placeholder bodies on 2026-10-21.
 // ---------------------------------------------------------------------------
 {
   const { projectDir, dataDir } = makeProjectAndData("missing-summary");
@@ -782,34 +787,50 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     maintenance: { ...MAINTENANCE_DEFAULTS },
   };
   const fixedCreated = new Date(Date.now() - 45 * 86400000).toISOString();
-  let capturedPrompt = "";
-  const backfillResponse = `<instinct>\n---\nid: legacy-habit\ntrigger: "legacy trigger text"\nconfidence: 0.6\ndomain: misc\nsummary: "Do the legacy thing."\n---\n# Legacy\n\n## Action\nDo the legacy thing.\n</instinct>`;
+  const fixedDecayed = new Date(Date.now() - 3 * 86400000).toISOString();
+  const storedBody = "# Legacy\n\n## Action\nDo the legacy thing. Then check it twice.\n\n## Evidence\n- Seen in the first session.";
+  const updateBody = "# Proven\n\n## Action\nA paraphrase written without seeing the stored body.\n\n## Evidence\n- Seen again in a later session.";
+  const updateResponse = `<instinct>\n---\nid: proven-habit\ntrigger: "proven trigger text"\nconfidence: 0.8\ndomain: misc\nsummary: "A new summary."\n---\n${updateBody}\n</instinct>`;
+  const replacementBody = "_Original body not supplied; carried over unchanged._";
+  const legacyReply = `<instinct>\n---\nid: legacy-habit\ntrigger: "legacy trigger text"\nconfidence: 0.6\ndomain: misc\nsummary: "Do the legacy thing."\n---\n${replacementBody}\n</instinct>`;
+  const prompts = [];
   const ctx = {
     location: { directory: projectDir },
     generate: {
       text: async (args) => {
-        capturedPrompt = args.prompt;
-        return { text: backfillResponse };
+        prompts.push(args.prompt);
+        return { text: `${legacyReply}\n\n${updateResponse}` };
       },
     },
     session: { synthetic: async () => ({}) },
   };
   const project = await resolveProject(ctx, options);
+  await writeInstinct(project.instincts_personal, { id: "legacy-habit", trigger: "legacy trigger text", confidence: 0.6, domain: "misc", created: fixedCreated }, storedBody);
+  const provenStored = "# Proven\n\n## Action\nRun the proven step first.\n\n## Evidence\n- First seen.";
   await writeInstinct(
     project.instincts_personal,
-    { id: "legacy-habit", trigger: "legacy trigger text", confidence: 0.6, domain: "misc", created: fixedCreated },
-    "# Legacy\n\n## Action\nDo the legacy thing.\n",
+    { id: "proven-habit", trigger: "proven trigger text", confidence: 0.7, domain: "misc", summary: "Run the proven step first.", created: fixedCreated, decayed_at: fixedDecayed, fired: 12 },
+    provenStored,
   );
+  await appendObservation(project, { event: "tool_complete", tool: "shell", output: "something happened" });
 
   const observer = createObserver(ctx, options);
-  const summary = await observer.run("sess-missing", { notify: false });
-  assert.ok(capturedPrompt.includes("## Missing Summaries"), "an existing instinct with no summary triggers the backfill prompt section");
-  assert.ok(capturedPrompt.includes("legacy-habit"), "the missing-summary section names the instinct");
-  assert.ok(!summary.includes("run skipped"), "a run with zero new observations but a missing summary still executes");
+  await observer.run("sess-missing", { notify: false });
 
-  const backfilledContent = await fs.readFile(path.join(project.instincts_personal, "legacy-habit.md"), "utf8");
-  assert.ok(backfilledContent.includes('summary: "Do the legacy thing."'), "the resubmitted block's summary is written");
-  assert.ok(backfilledContent.includes(`created: ${fixedCreated}`), "a summary-only backfill preserves the instinct's original created: date instead of resetting its age");
+  const legacy = await fs.readFile(path.join(project.instincts_personal, "legacy-habit.md"), "utf8");
+  assert.ok(legacy.includes('summary: "Do the legacy thing."'), `the summary comes from the instinct's own first Action sentence (file was:\n${legacy})`);
+  assert.ok(legacy.endsWith(`${storedBody}\n`), "a summary backfill keeps the stored body byte for byte");
+  assert.ok(!legacy.includes(replacementBody), "a model reply for a summary-less instinct never replaces its body");
+  assert.ok(legacy.includes(`created: ${fixedCreated}`), "a summary backfill keeps the instinct's created: date");
+
+  const proven = await fs.readFile(path.join(project.instincts_personal, "proven-habit.md"), "utf8");
+  assert.ok(proven.includes("Run the proven step first."), "an update keeps the stored Action");
+  assert.ok(!proven.includes("A paraphrase written without seeing the stored body."), "an update never replaces the stored Action with the model's");
+  assert.ok(proven.includes("- First seen.") && proven.includes("- Seen again in a later session."), "an update appends the block's evidence to the stored evidence");
+  assert.ok(/fired: 12/.test(proven), "an update keeps the instinct's fired count");
+  assert.ok(proven.includes(`created: ${fixedCreated}`) && proven.includes(`decayed_at: ${fixedDecayed}`), "an update keeps created: and decayed_at:");
+  assert.ok(proven.includes('summary: "Run the proven step first."'), "an update keeps the stored summary, which describes the stored Action");
+  assert.ok(!prompts[0].includes("## Missing Summaries"), "the prompt never asks the model to re-emit a body it is not shown");
 }
 
 // ---------------------------------------------------------------------------
@@ -882,17 +903,18 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     "control: a new id with the source's fields would merge into the target",
   );
 
+  await appendObservation(project, { event: "tool_complete", tool: "shell", output: "a commit was made" });
   const observer = createObserver(ctx, options);
   const firstRun = await observer.run("sess-backfill-no-merge", { notify: false });
-  assert.ok(prompts[0].split("## Missing Summaries")[1]?.includes(sourceFields.id), "run 1 asks the model for the summary-less instinct's summary");
   assert.ok(/1 written/.test(firstRun), `the re-emitted instinct is written to its own file (run said: ${firstRun.split("\n")[0]})`);
   const sourceAfter = await fs.readFile(path.join(project.instincts_personal, `${sourceFields.id}.md`), "utf8");
   assert.ok(sourceAfter.includes('summary: "Stage explicit paths and commit from a message file."'), "the backfilled summary lands on the instinct it belongs to");
-  assert.equal(await fs.readFile(targetFile, "utf8"), targetBefore, "the near-duplicate is left byte-for-byte alone: no merge, no new summary, no appended evidence");
+  const targetAfter = await fs.readFile(targetFile, "utf8");
+  assert.equal(targetAfter.split("\n---\n")[1], targetBefore.split("\n---\n")[1], "the near-duplicate's body is left alone: no merge, no appended evidence");
+  assert.ok(targetAfter.includes('summary: "Run detekt, lint and the LOC gate before the commit."'), "the near-duplicate's own summary comes from its own Action, never from the merge source");
 
   await observer.run("sess-backfill-no-merge", { notify: false });
-  assert.ok(!prompts[1].split("## Missing Summaries")[1]?.includes(sourceFields.id), "run 2 no longer lists the instinct as missing a summary, so nothing re-emits it again");
-  assert.equal(await fs.readFile(targetFile, "utf8"), targetBefore, "the near-duplicate is still untouched after a second run");
+  assert.equal(await fs.readFile(targetFile, "utf8"), targetAfter, "the near-duplicate is still untouched after a second run");
 }
 
 // ---------------------------------------------------------------------------
