@@ -2644,6 +2644,36 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const secondProvenPromote = await promoteStep(provenOptions, { log: () => {} });
   assert.equal(secondProvenPromote, 0, "already-global instinct is never promoted a second time via either path");
 
+  // --- promote: never an instinct whose trigger names one repository (a
+  //     registered project's name, or its own store's), and never one
+  //     whose id was retired to an archive. A dotfiles-only critics habit
+  //     reached the global store this way and was injected into every
+  //     other project's sessions; a global copy moved to the archive was
+  //     copied back by the next sweep. -----------------------------------
+  const scopedHome = path.join(maintRoot, "homunculus-scoped");
+  const dotfilesPersonal = path.join(scopedHome, "projects", "proj-dot", "instincts", "personal");
+  const termPersonal = path.join(scopedHome, "projects", "proj-term", "instincts", "personal");
+  await fs.mkdir(dotfilesPersonal, { recursive: true });
+  await fs.mkdir(termPersonal, { recursive: true });
+  await fs.writeFile(
+    path.join(scopedHome, "projects.json"),
+    JSON.stringify({ "proj-dot": { id: "proj-dot", name: "dotfiles", root: "/x/dotfiles" }, "proj-term": { id: "proj-term", name: "mightyterm", root: "/x/mightyterm" } }),
+    "utf8",
+  );
+  const proven = { confidence: 0.95, domain: "workflow", fired: 9, created: new Date().toISOString() };
+  await writeInstinct(dotfilesPersonal, { ...proven, id: "critics-before-release", trigger: "When a change is about to be published in the dotfiles repo, spawn read-only critics", summary: "Spawn critics.", project_name: "dotfiles" }, "# Critics\n");
+  await writeInstinct(dotfilesPersonal, { ...proven, id: "names-other-repo", trigger: "when a lane runs a build in a mightyterm worktree slot", summary: "Build in the slot.", project_name: "dotfiles" }, "# Other\n");
+  await writeInstinct(termPersonal, { ...proven, id: "retired-habit", trigger: "when a command is about to run for a long time", summary: "Background it.", project_name: "mightyterm" }, "# Retired\n");
+  await writeInstinct(termPersonal, { ...proven, id: "generic-habit", trigger: "when a search returns a line number inside a large file", summary: "Read a window around it.", project_name: "mightyterm" }, "# Generic\n");
+  await writeInstinct(path.join(scopedHome, "instincts", "archive"), { ...proven, id: "retired-habit", trigger: "when a command is about to run for a long time", summary: "Background it.", scope: "global" }, "# Retired\n");
+  const scopedLog = [];
+  await promoteStep({ dataDir: scopedHome }, { log: (line) => scopedLog.push(line) });
+  assert.deepEqual(
+    (await fs.readdir(path.join(scopedHome, "instincts", "personal"))).sort(),
+    ["generic-habit.md"],
+    `only the habit that names no repository and was never retired is promoted (log: ${scopedLog.join(" | ")})`,
+  );
+
   // --- prune: an old pending file, one within the warning window, one fresh
   const pruneProject = {
     project_dir: path.join(maintRoot, "proj-prune"),
