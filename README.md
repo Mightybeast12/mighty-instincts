@@ -295,7 +295,7 @@ This is at most one `generate.text` call per interval, on whatever model you set
 
 ## Prompt injection
 
-When `inject.enabled` is `true` (the default), every outgoing model request is checked against this project's instincts plus the shared global bucket. Up to `inject.max` instincts (default 5) meeting `inject.minConfidence` (default 0.8), excluding any id listed in `inject.exclude`, are added as one more system-context entry:
+When `inject.enabled` is `true` (the default), every outgoing model request is checked against this project's instincts plus the shared global bucket (an id both hold, as after a promotion, counts once, from the project copy). Up to `inject.max` instincts (default 5) meeting `inject.minConfidence` (default 0.8), excluding any id listed in `inject.exclude`, are added as one more system-context entry:
 
 ```
 <instincts> learned habits for this project

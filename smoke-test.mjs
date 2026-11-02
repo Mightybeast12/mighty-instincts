@@ -2513,6 +2513,44 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
+// 13d. lib/inject.js: the promote step copies an instinct to the global
+//      store under the same id, so the project and global stores can both
+//      hold it. The injected block lists it once, from the project copy
+//      (vendor/ecc/instinct-cli.py's load_all_instincts uses the same
+//      precedence), and only the project copy's fired count moves.
+// ---------------------------------------------------------------------------
+{
+  const { registerInject } = await import("./lib/inject.js");
+  const { projectDir, dataDir } = makeProjectAndData("inject-global-same-id");
+  const options = { python: "python3", dataDir, inject: { enabled: true, max: 5, minConfidence: 0.8 } };
+  const hooks = {};
+  const ctx = {
+    location: { directory: projectDir },
+    session: {
+      hook: async (name, cb) => {
+        hooks[name] = cb;
+        return { dispose: async () => {} };
+      },
+    },
+  };
+  const project = await resolveProject(ctx, options);
+  const globalDir = path.join(dataDir, "instincts", "personal");
+  const shared = { id: "bind-serial-once", trigger: "when running several commands against one emulator", confidence: 0.95, domain: "tooling", summary: "Export the serial once and wrap adb in a helper." };
+  await writeInstinct(project.instincts_personal, { ...shared, scope: "project" }, "# Bind\n\n## Action\nExport the serial once.\n");
+  await writeInstinct(globalDir, { ...shared, scope: "global" }, "# Bind\n\n## Action\nExport the serial once.\n");
+  await writeInstinct(globalDir, { id: "global-only", trigger: "a habit only the global store holds", confidence: 0.9, domain: "workflow", summary: "A global-only habit is still injected." }, "# Global only\n");
+
+  await registerInject(ctx, options);
+  const event = contextEvent({ sessionID: "inject-global-s1", userText: "please run several commands against the emulator" });
+  await hooks.context(event);
+  const lines = event.system[0].text.split("\n");
+  assert.equal(lines.filter((line) => line === `- ${shared.summary}`).length, 1, `an id held by both stores is injected once (block was:\n${event.system[0].text})`);
+  assert.ok(lines.includes("- A global-only habit is still injected."), "control: a global instinct whose id the project lacks is still injected");
+  assert.ok(/fired:\s*1/.test(await fs.readFile(path.join(project.instincts_personal, "bind-serial-once.md"), "utf8")), "the project copy is the one that fired");
+  assert.ok(!(await fs.readFile(path.join(globalDir, "bind-serial-once.md"), "utf8")).includes("fired:"), "the shadowed global copy is never bumped");
+}
+
+// ---------------------------------------------------------------------------
 // 14. lib/maintain.js: every maintenance step against a temp data dir.
 //     promote across two fake projects (exact-id match), prune an old
 //     pending file (plus a soon-to-expire warning and an unaffected
