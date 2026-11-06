@@ -2,11 +2,12 @@
  * OpenCode 2 sidebar panel for mighty-instincts.
  *
  * One collapsible box with a block per board source (Learned habits,
- * Skill notes, Skill test), read from the board-state.json the server
- * half (lib/board.js) writes, found through the pointer file
- * lib/board-pointer.js describes, and rendered from the structured block
- * model lib/board-text.js builds (also shared, unchanged in wording, by
- * the /board command's plain-text summary in lib/board-format.js).
+ * Skill notes, Skill test, and a "Health" block when there is anything
+ * to flag), read from the board-state.json the server half (lib/board.js)
+ * writes, found through the pointer file lib/board-pointer.js describes,
+ * and rendered from the structured block model lib/board-text.js builds
+ * (also shared, unchanged in wording, by the /board command's plain-text
+ * summary in lib/board-format.js).
  *
  * Laid out like the oh-my-opencode-slim agent panel (single border,
  * header row, two-space indented fact lines) so the two read as
@@ -43,7 +44,7 @@ import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 import fs from "node:fs";
 import { pointerFilePath } from "./lib/board-pointer.js";
-import { buildEvalsBlock, buildInstinctsBlock, buildObservationsBlock, GLYPH_CHAR, LEGEND } from "./lib/board-text.js";
+import { buildEvalsBlock, buildHealthBlock, buildInstinctsBlock, buildObservationsBlock, GLYPH_CHAR, LEGEND } from "./lib/board-text.js";
 import { BOARD_STORAGE_KEY, defaultInteractionState, mergeInteractionState } from "./lib/board-interaction.js";
 import { PKG_NAME, PKG_VERSION } from "./lib/pkg.js";
 
@@ -219,6 +220,18 @@ function renderPanel(data, colors, interaction, pulseFrameIndex) {
   }
   if (sections.evals !== false) {
     rows.push(...block({ key: "evals", model: buildEvalsBlock(state?.evals), interaction, colors }));
+  }
+  // A "doctor" block, rendered only when it actually has entries
+  // (buildHealthBlock's own `available` flag): unlike the three sections
+  // above, a project with nothing misconfigured never shows an empty
+  // "Health" title at all. Not one of lib/board-interaction.js's own
+  // BOARD_BLOCK_KEYS, so its collapsed state is not persisted across TUI
+  // restarts the way the other three blocks' is; interaction.toggleBlock/
+  // isBlockOpen still work for it within one running session, since
+  // neither is hardcoded to a fixed key list.
+  const healthModel = buildHealthBlock(state?.health);
+  if (healthModel.available) {
+    rows.push(...block({ key: "health", model: healthModel, interaction, colors }));
   }
   rows.push(legendRow(colors));
   return frame(colors, [header, ...rows]);

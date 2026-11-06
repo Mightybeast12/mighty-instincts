@@ -431,21 +431,30 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(statusReply.text.includes("No instincts found"), "status reflects the empty instinct store");
   assert.equal(harness.promptCalls.length, 0, "ctx.session.prompt is never called");
 
-  // /evolve without --generate previews lib/evolve-preview.js's own
-  // deterministic clusters and never shells out to instinct-cli.py at
-  // all (an empty project has nothing to cluster, so it reads as "no
-  // clusters yet"); only --generate still delegates to the real CLI.
+  // /evolve is now a single dispatcher (lib/evolve-command.js): bare,
+  // it shows the dashboard, never shelling out to instinct-cli.py (an
+  // empty project has nothing proposed, so the dashboard appends
+  // lib/evolve-preview.js's own deterministic cluster preview, which
+  // reads as "no clusters yet" here); "clusters" shows that same
+  // preview on its own; and --generate is no longer a recognised flag
+  // at all, so it is read as an (unmatched) candidate id instead of
+  // ever reaching the Python CLI's own evolve implementation.
   const evolveCommand = harness.commandDefs.find((def) => def.name === "evolve");
   await evolveCommand.execute({ sessionID: "cmd-session", prompt: { text: "" } });
-  const evolvePreviewReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
-  assert.ok(evolvePreviewReply.text.includes("No instinct clusters found yet"), "the no-flag preview path runs lib/evolve-preview.js, not instinct-cli.py");
-  assert.equal(evolvePreviewReply.resume, true, "the evolve preview still posts as a resumed, direct reply, same as every other command");
+  const evolveDashboardReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
+  assert.ok(evolveDashboardReply.text.includes("0 candidate(s): 0 proposed, 0 installed, 0 archived."), "the bare /evolve dashboard shows the header counts");
+  assert.ok(evolveDashboardReply.text.includes("No instinct clusters found yet"), "nothing proposed: the dashboard appends the cluster preview, not instinct-cli.py's own output");
+  assert.equal(evolveDashboardReply.resume, true, "the evolve dashboard still posts as a resumed, direct reply, same as every other command");
+
+  await evolveCommand.execute({ sessionID: "cmd-session", prompt: { text: "clusters" } });
+  const evolveClustersReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
+  assert.ok(evolveClustersReply.text.includes("No instinct clusters found yet"), "the 'clusters' verb shows the same deterministic preview on its own");
 
   await evolveCommand.execute({ sessionID: "cmd-session", prompt: { text: "--generate" } });
   const evolveGenerateReply = harness.syntheticCalls.filter((call) => call.sessionID === "cmd-session").pop();
   assert.ok(
-    !evolveGenerateReply.text.includes("No instinct clusters found yet"),
-    "--generate still delegates to instinct-cli.py's own evolve output, not lib/evolve-preview.js's sentinel text",
+    evolveGenerateReply.text.includes("No candidate found with id '--generate'"),
+    "--generate is just an unrecognised id now; the Python evolve path is unreachable from /evolve",
   );
 
   // The instincts tool itself only exposes the read-only subset and never
@@ -1019,8 +1028,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   // Three personal instinct files, two domains, three distinct
   // confidences; no inherited, no global-personal files. mtimes are set
   // explicitly (rather than trusted to real wall-clock write order) so
-  // the "newest instinct" fact is deterministic.
-  await writeInstinct(project.instincts_personal, { id: "alpha-instinct", trigger: "a", confidence: 0.9, domain: "workflow" }, "# Alpha\n");
+  // the "newest instinct" fact is deterministic. alpha also carries
+  // `fired: 3`, so it qualifies under lib/maintain.js's promoteStep own
+  // fired-proven path (confidence >= 0.9 and fired >= 3 in a single
+  // project, no cross-project corroboration needed); beta and gamma do
+  // not (beta's confidence is below that path's own 0.9 floor, and
+  // neither has fired at all).
+  await writeInstinct(project.instincts_personal, { id: "alpha-instinct", trigger: "a", confidence: 0.9, domain: "workflow", fired: 3 }, "# Alpha\n");
   await writeInstinct(project.instincts_personal, { id: "beta-instinct", trigger: "b", confidence: 0.85, domain: "workflow" }, "# Beta\n");
   await writeInstinct(project.instincts_personal, { id: "gamma-instinct", trigger: "c", confidence: 0.6, domain: "tooling" }, "# Gamma\n");
   const now = Date.now();
@@ -1129,14 +1143,21 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(state.instincts.global, 0, "no global-personal instinct files");
   assert.equal(state.instincts.lastRun, lastRunAt);
   assert.equal(state.instincts.pendingObservations, 14, "19 lines on disk minus 5 counted last run");
-  assert.equal(state.instincts.minObservations, 20, "default minObservations (options.observer here sets no override)");
+  assert.equal(state.instincts.minObservations, 40, "default minObservations matches lib/plugin.js's own DEFAULT_OPTIONS (options.observer here sets no override)");
   assert.equal(
     state.instincts.nextRunEligibleAt,
     new Date(new Date(lastRunAt).getTime() + 10 * 60000).toISOString(),
     "next run eligible 10 minutes after lastRunAt",
   );
   assert.equal(state.instincts.nextRunReady, false, "the interval gate alone (2 of 10 minutes elapsed) is not enough to be ready yet");
-  assert.equal(state.instincts.readyToShare, 2, "0.9 and 0.85 both clear the 0.8 promote threshold and neither is in the (empty) global bucket");
+  // readyToShare now comes from the real lib/maintain.js promoteStep
+  // (dry-run), not a confidence-only guess: alpha (confidence 0.9, fired
+  // 3) qualifies under promoteStep's own fired-proven path (confidence
+  // >= 0.9 and fired >= 3 in a single project, no cross-project
+  // corroboration needed); beta (confidence 0.85, below that path's own
+  // 0.9 floor) and gamma do not, and this fixture has only one project
+  // registered, so the cross-project path never applies to either.
+  assert.equal(state.instincts.readyToShare, 1, "alpha qualifies under the real promote rule's fired-proven path; beta and gamma do not");
   assert.equal(state.instincts.habitsInPrompts, 2, "alpha (0.9) and beta (0.85) clear the default 0.8 inject.minConfidence; gamma (0.6) does not");
   assert.deepEqual(state.instincts.firedTodayTop, [], "no .activity.json written in this fixture, so nothing fired today");
   assert.equal(state.instincts.newestId, "gamma-instinct", "gamma-instinct has the latest mtime (touched to 'now')");
@@ -1665,32 +1686,42 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(unavailableInstincts.headline, "none");
   assert.deepEqual(unavailableInstincts.rows, []);
 
-  // --- hint rows: "ready to share globally" and "skill candidates" ----
+  // --- hint rows: "ready to share globally" now hints the bare command --
   const withShareHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 4 });
   const shareRowIndex = withShareHint.rows.findIndex((row) => row.label === "ready to share globally");
   assert.equal(withShareHint.rows[shareRowIndex].value, "4");
-  assert.equal(withShareHint.rows[shareRowIndex + 1]?.hint, "run /promote to share them", "the hint row immediately follows the row it annotates");
+  assert.equal(withShareHint.rows[shareRowIndex + 1]?.hint, "/promote", "the hint row immediately follows the row it annotates");
 
-  const withCandidates = buildInstinctsBlock({
+  // --- candidate lifecycle rows (the /evolve grammar): up to 3 numbered
+  //     proposed rows from `proposedList`, each naming its own /evolve
+  //     pick, plus one combined installed/unused summary line ----------
+  const withProposed = buildInstinctsBlock({
     project: 5,
     inherited: 0,
     global: 0,
     observerEnabled: true,
     lastRun: new Date().toISOString(),
     readyToShare: 0,
-    skillCandidates: 2,
-    candidatesPath: "/tmp/evolved",
+    proposedList: [
+      { index: 1, id: "workflow-abc123", kind: "skill", members: ["a", "b", "c", "d"], summary: "s1" },
+      { index: 2, id: "tooling-def456", kind: "rule", members: ["e", "f", "g"], summary: "s2" },
+      { index: 3, id: "testing-ghi789", kind: "command", members: ["h", "i", "j"], summary: "s3" },
+      { index: 4, id: "would-be-dropped", kind: "skill", members: ["k", "l", "m"], summary: "s4" },
+    ],
   });
-  const candidatesRowIndex = withCandidates.rows.findIndex((row) => row.label === "skill candidates");
-  assert.equal(withCandidates.rows[candidatesRowIndex].value, "2");
-  assert.equal(withCandidates.rows[candidatesRowIndex + 1]?.hint, "run /evolve-list");
+  assert.deepEqual(
+    withProposed.rows.filter((row) => "hint" in row).map((row) => row.hint),
+    [
+      "1 workflow-abc123 [skill], 4 habits: /evolve 1",
+      "2 tooling-def456 [rule], 3 habits: /evolve 2",
+      "3 testing-ghi789 [command], 3 habits: /evolve 3",
+    ],
+    "up to 3 proposed candidates get their own numbered row, each naming the exact same index /evolve resolves a pick against; a 4th is never shown",
+  );
 
-  const withoutCandidates = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 0, skillCandidates: 0 });
-  assert.ok(!withoutCandidates.rows.some((row) => row.label === "skill candidates"), "skillCandidates: 0 omits the row entirely");
+  const withoutProposed = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), readyToShare: 0, proposedList: [] });
+  assert.ok(!withoutProposed.rows.some((row) => row.hint?.includes("/evolve")), "an empty proposedList renders no candidate rows at all");
 
-  // --- "installed from habits" and "unused candidates" (0.8.0's evolve
-  //     lifecycle rows): both omitted at 0, both shown with the right
-  //     hint text once nonzero -----------------------------------------
   const withInstalledAndUnused = buildInstinctsBlock({
     project: 5,
     inherited: 0,
@@ -1700,10 +1731,10 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     installedFromHabits: 3,
     unusedCandidates: 1,
   });
-  assert.ok(withInstalledAndUnused.rows.some((row) => row.label === "installed from habits" && row.value === "3"));
-  const unusedRowIndex = withInstalledAndUnused.rows.findIndex((row) => row.label === "unused candidates");
-  assert.equal(withInstalledAndUnused.rows[unusedRowIndex].value, "1");
-  assert.equal(withInstalledAndUnused.rows[unusedRowIndex + 1]?.hint, "see /evolve-list");
+  assert.ok(
+    withInstalledAndUnused.rows.some((row) => row.hint === "installed from habits 3 (1 unused): /evolve"),
+    "installed + unused folds into one summary hint line instead of two separate rows",
+  );
 
   const withoutInstalledOrUnused = buildInstinctsBlock({
     project: 5,
@@ -1714,8 +1745,51 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     installedFromHabits: 0,
     unusedCandidates: 0,
   });
-  assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.label === "installed from habits"), "installedFromHabits: 0 omits the row entirely");
-  assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.label === "unused candidates"), "unusedCandidates: 0 omits the row entirely");
+  assert.ok(!withoutInstalledOrUnused.rows.some((row) => row.hint?.startsWith("installed from habits")), "installedFromHabits: 0 omits the summary line entirely");
+
+  // --- Goal 1: hints that act (observer disabled, blocked, failures) --
+  const disabledHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: false, lastRun: new Date().toISOString() });
+  assert.ok(
+    disabledHint.rows.some((row) => row.hint === "learning off: /instinct observer on (needs observer.model)"),
+    "a disabled observer gets an actionable hint row instead of leaving the amber glyph unexplained",
+  );
+  assert.ok(!disabledHint.rows.some((row) => row.label === "next learning run"), "no 'next learning run' label row while disabled");
+
+  const blockedHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), blocked: "model-unset" });
+  assert.ok(blockedHint.rows.some((row) => row.hint === "learning paused: set observer.model"), "blocked: model-unset gets its own hint row");
+
+  const failuresHint = buildInstinctsBlock({
+    project: 5,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    failures: 2,
+    nextAttemptAfter: new Date(Date.now() + 5 * 60000).toISOString(),
+  });
+  assert.ok(
+    failuresHint.rows.some((row) => row.hint === "last learning run failed (2), retry 5m"),
+    "failures > 0 gets a hint row naming the count and a relative retry time",
+  );
+  const failuresNoRetryHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), failures: 1, nextAttemptAfter: null });
+  assert.ok(failuresNoRetryHint.rows.some((row) => row.hint === "last learning run failed (1), retry soon"), "no nextAttemptAfter on record falls back to 'retry soon'");
+  const noFailuresHint = buildInstinctsBlock({ project: 5, inherited: 0, global: 0, observerEnabled: true, lastRun: new Date().toISOString(), failures: 0 });
+  assert.ok(!noFailuresHint.rows.some((row) => row.hint?.startsWith("last learning run failed")), "failures: 0 omits the row entirely");
+
+  // --- Goal 6: top 5 habits by confidence, at the end of the block ----
+  const withTopHabits = buildInstinctsBlock({
+    project: 2,
+    inherited: 0,
+    global: 0,
+    observerEnabled: true,
+    lastRun: new Date().toISOString(),
+    list: [
+      { id: "habit-a", confidence: 0.95, domain: "workflow", trigger: "t", fired: 0 },
+      { id: "habit-b", confidence: 0.5, domain: "workflow", trigger: "t", fired: 0 },
+    ],
+  });
+  const topHabitHints = withTopHabits.rows.filter((row) => "hint" in row).map((row) => row.hint);
+  assert.deepEqual(topHabitHints, ["95% habit-a", "50% habit-b"], "the top habits by confidence are rendered as '<pct> <id>' rows, at the end of the block");
 
   // --- "habits in prompts": a live eligibility count, shown even at 0
   //     (unlike "used today / this week", a per-day/per-week tally that
@@ -2316,10 +2390,11 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 //      instincts the same way lib/maintain.js's evolveStep does (domain,
 //      then significant-word overlap), and additionally computes each
 //      cluster's average confidence, a deterministic "why" (the words
-//      every member's own text actually shares), and a size-based
-//      suggested form (rule < command < skill); formatEvolvePreview then
-//      renders the top N (0 = no cap), always ending with the --generate
-//      hint, and reads as "no clusters yet" when none qualify.
+//      every member's own text actually shares), and a suggested form
+//      via candidates.js's own selectCandidateKind; formatEvolvePreview
+//      then renders the top N (0 = no cap), always ending with the
+//      "run /evolve now" hint, and reads as "no clusters yet" when none
+//      qualify.
 // ---------------------------------------------------------------------------
 {
   const { buildEvolveClusters, formatEvolvePreview } = await import("./lib/evolve-preview.js");
@@ -2387,7 +2462,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const limited = formatEvolvePreview(clusters, { limit: 1 });
   assert.ok(limited.startsWith("1 of 2 cluster(s) found:"), "the header's own total still counts every qualifying cluster, even when limit trims the list shown");
   assert.ok(!limited.includes("testing-habit-0"), "the second cluster's members are not shown when limit=1");
-  assert.ok(limited.endsWith("Run /evolve --generate to write these as candidate structures under evolved/."), "the preview always ends with the --generate hint");
+  assert.ok(limited.endsWith("Run /evolve now to propose candidates from these clusters."), "the preview always ends with the 'run /evolve now' hint");
 
   const unlimited = formatEvolvePreview(clusters, { limit: 0 });
   assert.ok(unlimited.includes("workflow-habit-0") && unlimited.includes("testing-habit-0"), "limit 0 shows every qualifying cluster");
@@ -3242,20 +3317,22 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
-// 17. lib/commands.js's candidate-lifecycle commands, against a temp HOME
-//     set through `evolve.targets` (an absolute dir per
-//     skill/command/agent, an absolute file for rule): /evolve-install's
-//     two-step confirm (preview without --yes installs nothing; --yes
-//     installs for every kind, including the AGENTS.md rule append, each
-//     carrying candidate_id/project_id/members markers and an
-//     installed_hash), /evolve-show and /evolve-list <id> rendering the
-//     same detail, refusing to overwrite a hand-written file (even one
-//     whose own prose merely mentions the marker text), refusing a file
-//     that belongs to a different candidate_id, /evolve-reject archiving
-//     a proposed candidate (and refusing to "reject" an installed one),
-//     and /evolve-archive removing an installed file only when ownership
-//     and content both still match, leaving a hand-edited one in place
-//     with a reason instead.
+// 17. lib/commands.js's deprecated evolve-* aliases, forwarding into
+//     lib/evolve-command.js's unified /evolve dispatcher, against a temp
+//     HOME set through `evolve.targets` (an absolute dir per
+//     skill/command/agent, an absolute file for rule): evolve-install's
+//     look-before-leap (without --yes it renders the same detail
+//     evolve-show/evolve-list <id> would; --yes only actually writes
+//     once that exact candidate's detail has been rendered in this
+//     process, for every kind, including the AGENTS.md rule append,
+//     each carrying candidate_id/project_id/members markers and an
+//     installed_hash), refusing to overwrite a hand-written file (even
+//     one whose own prose merely mentions the marker text), refusing a
+//     file that belongs to a different candidate_id, evolve-reject
+//     archiving a proposed candidate (and refusing to "reject" an
+//     installed one), and evolve-archive removing an installed file
+//     only when ownership and content both still match, leaving a
+//     hand-edited one in place with a reason instead.
 // ---------------------------------------------------------------------------
 {
   const { projectDir: cmdProjectDir, dataDir: cmdDataDir } = makeProjectAndData("evolve-commands");
@@ -3285,29 +3362,31 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     );
   }
 
-  // --- /evolve-install without --yes: previews, writes nothing --------
+  // --- evolve-install without --yes: renders detail, writes nothing ----
   await seedCandidate("skill", "skillcand1", "my-skill", ["m1", "m2", "m3", "m4"]);
   await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
   const previewReply = lastReply();
-  assert.ok(previewReply.includes("kind: skill") && previewReply.includes("--- body ---"), "the preview shows kind and the full drafted body");
-  assert.ok(previewReply.includes("Re-run with --yes to install."), "no --yes: stops with the re-run instruction");
+  assert.ok(previewReply.includes("alias of /evolve skillcand1; this alias goes away in a later release."), "the alias prefix names its own /evolve equivalent");
+  assert.ok(previewReply.includes("kind: skill") && previewReply.includes("--- body ---"), "the detail shows kind and the full drafted body");
+  assert.ok(previewReply.includes("Next: /evolve") && previewReply.includes("install") && previewReply.includes("reject"), "evolve-install without --yes renders the same detail /evolve <id> would, offering install and reject next");
   await assert.rejects(fs.access(path.join(targets.skill, "my-skill", "SKILL.md")), "nothing was written without --yes");
   const stillProposed = await findCandidateById(cmdProject.evolved_dir, "skillcand1");
-  assert.equal(stillProposed.fields.status, "proposed", "previewing never changes the candidate's own status");
+  assert.equal(stillProposed.fields.status, "proposed", "rendering detail never changes the candidate's own status");
 
-  // /evolve-show renders the identical detail, on demand, without --yes
-  // ever being relevant to it (it never appends the install re-run hint).
+  // evolve-show and evolve-list <id> map to the exact same bare pick as
+  // evolve-install without --yes, so all three render byte-for-byte the
+  // same reply (alias prefix included).
   await findCmd("evolve-show").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
   const showReply = lastReply();
-  assert.ok(previewReply.startsWith(showReply.slice(0, -4)), "/evolve-install's own preview starts with /evolve-show's exact detail");
-  assert.ok(!showReply.includes("Re-run with --yes to install."), "/evolve-show never appends the install re-run hint");
+  assert.equal(showReply, previewReply, "evolve-show renders the identical detail evolve-install's own preview just did");
 
-  // /evolve-list <id> renders the same detail too.
   await findCmd("evolve-list").execute({ sessionID: "s1", prompt: { text: "skillcand1" } });
-  assert.equal(lastReply(), showReply, "/evolve-list <id> is another alias for the same single-candidate detail");
+  assert.equal(lastReply(), showReply, "evolve-list <id> is another alias for the same single-candidate detail");
 
-  // --- /evolve-install --yes: skill, command, agent, and the AGENTS.md rule
+  // --- evolve-install --yes: now installs, since skillcand1's own
+  //     detail was already rendered three times above -------------------
   await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "skillcand1 --yes" } });
+  assert.ok(lastReply().includes("alias of /evolve skillcand1 install; this alias goes away in a later release."));
   assert.ok(lastReply().includes("Restart OpenCode to load it."), "install ends with the restart instruction");
   const skillFile = path.join(targets.skill, "my-skill", "SKILL.md");
   const skillContent = await fs.readFile(skillFile, "utf8");
@@ -3321,7 +3400,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(typeof skillCandidateAfter.fields.installed_at === "string");
   assert.equal(skillCandidateAfter.fields.installed_hash, hashContent(skillContent), "installed_hash matches exactly what was written");
 
+  // For every other kind below, evolve-install --yes is called twice:
+  // the first call (a never-before-viewed candidate) renders detail
+  // instead of installing (the look-before-leap), the second actually
+  // installs.
   await seedCandidate("command", "cmdcand1", "my-cmd", ["m1", "m2"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "cmdcand1 --yes" } });
+  assert.ok(lastReply().includes("install again to install."), "a never-viewed candidate is shown its own detail first, even with --yes");
   await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "cmdcand1 --yes" } });
   const cmdFile = path.join(targets.command, "my-cmd.md");
   const cmdContent = await fs.readFile(cmdFile, "utf8");
@@ -3331,12 +3416,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   await seedCandidate("agent", "agentcand1", "my-agent", ["m1"]);
   await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "agentcand1 --yes" } });
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "agentcand1 --yes" } });
   const agentFile = path.join(targets.agent, "my-agent.md");
   const agentContent = await fs.readFile(agentFile, "utf8");
   assert.ok(agentContent.includes("mode: subagent"));
   assert.ok(agentContent.includes("candidate_id: agentcand1"));
 
   await seedCandidate("rule", "rulecand1", "my-rule", ["m1", "m2"]);
+  await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "rulecand1 --yes" } });
   await findCmd("evolve-install").execute({ sessionID: "s1", prompt: { text: "rulecand1 --yes" } });
   const ruleContent = await fs.readFile(targets.rule, "utf8");
   assert.ok(ruleContent.includes("## Learned rules (mighty-instincts)"));
@@ -3347,7 +3434,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 
   // --- refuse to overwrite a hand-written file, even one whose own
   //     prose merely mentions the marker text (not a real frontmatter
-  //     field) ---------------------------------------------------------
+  //     field); the first --yes call still only renders detail ---------
   await fs.mkdir(path.join(targets.skill, "hand-written"), { recursive: true });
   await fs.writeFile(
     path.join(targets.skill, "hand-written", "SKILL.md"),
@@ -3355,6 +3442,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     "utf8",
   );
   await seedCandidate("skill", "skillcand2", "hand-written", ["m1", "m2", "m3", "m4"]);
+  await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand2 --yes" } });
   await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand2 --yes" } });
   const refuseReply = lastReply();
   assert.ok(refuseReply.includes("Refused:") && refuseReply.includes("not written by mighty-instincts"), "marker text merely in the body's prose is never mistaken for a real marker");
@@ -3375,11 +3463,12 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   );
   await seedCandidate("skill", "skillcand3", "shared-name", ["m1", "m2", "m3", "m4"]);
   await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand3 --yes" } });
+  await findCmd("evolve-install").execute({ sessionID: "s2", prompt: { text: "skillcand3 --yes" } });
   assert.ok(lastReply().includes("Refused:"), "a file genuinely ours, but for a different candidate_id, is still refused");
   const untouchedOther = await fs.readFile(path.join(targets.skill, "shared-name", "SKILL.md"), "utf8");
   assert.ok(untouchedOther.includes("owned by another candidate"), "the other candidate's installed file is left exactly as it was");
 
-  // --- /evolve-reject: proposed -> archived with a reason ---------------
+  // --- evolve-reject: proposed -> archived with a reason ---------------
   await seedCandidate("rule", "rejectcand1", "reject-me", ["m1", "m2"]);
   await findCmd("evolve-reject").execute({ sessionID: "s3", prompt: { text: "rejectcand1 not useful here" } });
   assert.ok(lastReply().includes("Archived candidate 'rejectcand1' (reason: not useful here)."));
@@ -3388,9 +3477,9 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(rejectedCandidate.fields.reason, "not useful here");
 
   await findCmd("evolve-reject").execute({ sessionID: "s3", prompt: { text: "cmdcand1" } });
-  assert.ok(lastReply().includes("use /evolve-archive to remove it instead"), "rejecting an already-installed candidate points at /evolve-archive instead");
+  assert.ok(lastReply().includes("already installed") && lastReply().includes("archive"), "rejecting an already-installed candidate points at archive instead");
 
-  // --- /evolve-archive: removes the installed file when ownership and
+  // --- evolve-archive: removes the installed file when ownership and
   //     content both still match, but leaves a hand-edited one in place
   //     with a reason --------------------------------------------------
   await findCmd("evolve-archive").execute({ sessionID: "s4", prompt: { text: "cmdcand1" } });
@@ -3410,11 +3499,12 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const archivedAgentCandidate = await findCandidateById(cmdProject.evolved_dir, "agentcand1");
   assert.equal(archivedAgentCandidate.fields.status, "archived", "the candidate itself is still archived even though its file was left alone");
 
-  // --- /evolve-list: a quick sanity check on the summary line ----------
+  // --- evolve-list: a quick sanity check on the dashboard's own header
+  //     and its installed-candidate line -------------------------------
   await findCmd("evolve-list").execute({ sessionID: "s6", prompt: { text: "" } });
   const listReply = lastReply();
   assert.ok(/\d+ candidate\(s\): \d+ proposed, \d+ installed, \d+ archived\./.test(listReply));
-  assert.ok(listReply.includes("skillcand1 [skill] status=installed"));
+  assert.ok(listReply.includes("skillcand1 [skill] installed"));
 
   await Promise.allSettled(harness.registrations.map((registration) => registration?.dispose?.()));
 }
@@ -3508,9 +3598,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   );
 
   await harness1.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p1", prompt: { text: "proj1-cand --yes" } });
+  assert.ok(harness1.syntheticCalls.at(-1).text.includes("install again to install."), "a never-viewed candidate is shown its own detail first, even with --yes");
+  await harness1.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p1", prompt: { text: "proj1-cand --yes" } });
   const installedByProj1 = await fs.readFile(path.join(sharedTargets.skill, "shared", "SKILL.md"), "utf8");
   assert.ok(installedByProj1.includes(`project_id: ${project1.id}`));
 
+  await harness2.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p2", prompt: { text: "proj2-cand --yes" } });
+  assert.ok(harness2.syntheticCalls.at(-1).text.includes("install again to install."), "project 2's own candidate also needs its own detail rendered first");
   await harness2.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "p2", prompt: { text: "proj2-cand --yes" } });
   const refusedReply = harness2.syntheticCalls.at(-1).text;
   assert.ok(refusedReply.includes("Refused:"), "project 2 cannot install over project 1's own candidate at the shared path");
@@ -3569,6 +3663,8 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     renderCandidateBody("skill", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }], "linked"),
   );
   await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s1", prompt: { text: "symcand1 --yes" } });
+  assert.ok(harness.syntheticCalls.at(-1).text.includes("install again to install."), "a never-viewed candidate is shown its own detail first, even with --yes");
+  await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s1", prompt: { text: "symcand1 --yes" } });
   const symlinkReply = harness.syntheticCalls.at(-1).text;
   assert.ok(symlinkReply.includes("Refused:") && symlinkReply.includes("symlink"), "install never follows or replaces a symlinked target");
   assert.equal(await fs.readFile(elsewhere, "utf8"), "not a skill\n", "the symlink's real target is completely untouched");
@@ -3585,6 +3681,8 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     { id: "rulesym1", kind: "rule", status: "proposed", created: new Date().toISOString(), members: ["m1", "m2"], summary: "s", suggested_name: "rulesym" },
     renderCandidateBody("rule", "testing", [{ fields: { id: "m1", trigger: "t", summary: "Do it." } }, { fields: { id: "m2", trigger: "t", summary: "Do it too." } }], "rulesym"),
   );
+  await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s2", prompt: { text: "rulesym1 --yes" } });
+  assert.ok(harness.syntheticCalls.at(-1).text.includes("install again to install."), "a never-viewed candidate is shown its own detail first, even with --yes");
   await harness.commandDefs.find((def) => def.name === "evolve-install").execute({ sessionID: "s2", prompt: { text: "rulesym1 --yes" } });
   const ruleSymReply = harness.syntheticCalls.at(-1).text;
   assert.ok(ruleSymReply.includes("Restart OpenCode to load it."), "a symlinked AGENTS.md is written through, not refused");
@@ -4314,4 +4412,26 @@ domain: general
 This id fails the ^[a-z0-9][a-z0-9-]{1,63}$ pattern.`;
 
   return [valid, duplicateOfInherited, badBody, badId].map((block) => `<instinct>\n${block}\n</instinct>`).join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Lane test modules. Every file under smoke/*.mjs exports `run(helpers)`
+// and receives this file's harness helpers, so parallel work lands in its
+// own module instead of this one.
+// ---------------------------------------------------------------------------
+{
+  const smokeDir = new URL("./smoke/", import.meta.url);
+  let names = [];
+  try {
+    names = fsSync.readdirSync(smokeDir).filter((name) => name.endsWith(".mjs")).sort();
+  } catch {
+    names = [];
+  }
+  const helpers = { assert, createPluginHarness, makeProjectAndData, readJsonLines, waitFor, contextEvent, TEMP_ROOT };
+  for (const name of names) {
+    const mod = await import(new URL(name, smokeDir));
+    if (typeof mod.run !== "function") throw new Error(`smoke/${name} must export run(helpers)`);
+    await mod.run(helpers);
+    console.log(`smoke/${name}: ok`);
+  }
 }
