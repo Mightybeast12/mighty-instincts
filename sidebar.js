@@ -42,8 +42,7 @@
 
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
-import fs from "node:fs";
-import { pointerFilePath } from "./lib/board-pointer.js";
+import { readBoardState } from "./lib/board-pointer.js";
 import { buildEvalsBlock, buildHealthBlock, buildInstinctsBlock, buildObservationsBlock, GLYPH_CHAR, LEGEND } from "./lib/board-text.js";
 import { BOARD_STORAGE_KEY, defaultInteractionState, mergeInteractionState } from "./lib/board-interaction.js";
 import { PKG_NAME, PKG_VERSION } from "./lib/pkg.js";
@@ -53,18 +52,17 @@ const BORDER = { type: "single" };
 const POLL_MS = 1000;
 const GLYPH_EXPANDED = "\u25be"; // ▾
 const GLYPH_COLLAPSED = "\u25b8"; // ▸
-// Pulse glyph cycle for the Learned habits title (task: "reuse the
-// spinner frames idea"): a slow breathe, not a spinner direction, since
-// this means "recently active", not "in progress". Replaces the block's
-// usual status circle while an observation landed in the last
-// PULSE_WINDOW_MS, exactly as it did for the old "Instincts" title. Drawn
-// in the block's own state colour (glyphColor(model.glyph, colors) in
-// block() below), not a colour of its own, so a pulsing title still reads
-// as "active"/"attention"/"stale" at a glance; only the glyph shape
+// Pulse glyph cycle for the Learned habits title: a slow breathe, not a
+// spinner direction, since this means "recently active", not "in
+// progress". Replaces the block's own status circle while an
+// observation landed in the last PULSE_WINDOW_MS, in the block's own
+// state colour (glyphColor(model.glyph, colors) in block() below), not a
+// colour of its own, so a pulsing title still reads as
+// "active"/"attention"/"stale" at a glance; only the glyph shape
 // (breathing dot vs. the plain state circle) marks "recently active" on
-// top of that. 10s, not 60s: a 60s window stayed lit long past the last
-// observation, freezing on PULSE_FRAMES' own "•" frame between ticks
-// rather than ever settling back to the real state circle.
+// top of that. 10s, not 60s: a 60s window stays lit long past the last
+// observation, freezing on PULSE_FRAMES' own "bullet" frame between
+// ticks rather than ever settling back to the real state circle.
 const PULSE_FRAMES = ["\u00b7", "\u2022", "\u25cf", "\u2022"]; // · • ● •
 const PULSE_MS = 500;
 const PULSE_WINDOW_MS = 10000;
@@ -175,27 +173,6 @@ function buildView(ctx) {
   return { sections, state: readBoardState(ctx) };
 }
 
-function readBoardState(ctx) {
-  try {
-    const directory = ctx.location?.directory ?? safe(() => ctx.data?.location?.default?.())?.directory;
-    if (!directory) return null;
-    const pointerPath = pointerFilePath(ctx.options ?? {}, directory);
-    const pointer = JSON.parse(fs.readFileSync(pointerPath, "utf8"));
-    if (!pointer?.boardStatePath) return null;
-    return JSON.parse(fs.readFileSync(pointer.boardStatePath, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function safe(read) {
-  try {
-    return read();
-  } catch {
-    return undefined;
-  }
-}
-
 // ---------------------------------------------------------------- view
 
 function renderPanel(data, colors, interaction, pulseFrameIndex) {
@@ -291,9 +268,9 @@ function detailRow(row, colors) {
   ]);
 }
 
-// A hint sub-row ("run /promote to share them", "see <path>"): indented
-// one level deeper than a detail row and with no value column of its own,
-// since it is explanatory text, not a fact.
+// A hint sub-row ("/promote", "see <path>"): indented one level deeper
+// than a detail row and with no value column of its own, since it is
+// explanatory text, not a fact.
 function hintRow(hint, colors) {
   return box({ width: "100%", flexDirection: "row", paddingLeft: 4, shouldFill: true }, [
     text({ fg: colors.muted, wrapMode: "none", truncate: true }, [hint]),

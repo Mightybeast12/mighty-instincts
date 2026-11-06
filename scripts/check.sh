@@ -28,7 +28,9 @@ set -euo pipefail
 #             fixture before it is trusted against the repo
 #   skeleton  scripts/sync-skeleton.sh --check against the sibling repo
 #             this skeleton is shared with; skipped with a loud notice
-#             when the sibling directory cannot be found
+#             when the sibling directory cannot be found, but FAILS
+#             when more than one sibling candidate is found (ambiguous,
+#             see the candidate list it prints)
 #
 # Flags:
 #   --only <stage>[,<stage>,...]   run only the named stage(s) (always in
@@ -98,6 +100,7 @@ ONLY=""
 STAGED=0
 ALLOW_MISSING_BUN=0
 SELF_TEST=0
+SKIPPED_STAGES=()
 
 function parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -182,47 +185,63 @@ function dash_self_test() {
     log_info "dashes: self-test passed (detector caught an en dash in a scratch fixture)"
 }
 
-function stage_syntax() {
-    local label="tracked"
+# materialize_candidates <pathspec...> - fills the globals
+# MATERIALIZE_LABEL ("tracked" or "staged"), MATERIALIZE_ROOT (a
+# scratch dir to clean up afterward, or empty when not staged), and
+# MATERIALIZE_PAIRS (an array of "<relative-path>\t<path-to-check>"
+# entries) for the given git pathspecs: tracked files, or, with
+# --staged, each file's staged blob (git show :<path>) plus a staged
+# copy of package.json (node --check needs it next to a file to tell
+# ESM from CJS). Call this bare, never inside $(...)/||/if: it sets
+# these as plain globals for the caller to read, which only works when
+# this function runs in the caller's own shell, not a subshell.
+function materialize_candidates() {
     local files
-    local staged_root=""
+    MATERIALIZE_PAIRS=()
     if [[ "$STAGED" -eq 1 ]]; then
-        label="staged"
-        files="$(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -- '*.js' '*.mjs' || true)"
-        staged_root="$(scratch_dir)"
-        # node --check reads the nearest package.json to tell ESM from CJS;
-        # without it a .js blob parses as CommonJS and every `import` fails.
-        git -C "$REPO_DIR" show :package.json > "$staged_root/package.json" 2>/dev/null \
-            || cp "$REPO_DIR/package.json" "$staged_root/package.json"
+        MATERIALIZE_LABEL="staged"
+        files="$(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -- "$@" || true)"
+        MATERIALIZE_ROOT="$(scratch_dir)"
+        git -C "$REPO_DIR" show :package.json > "$MATERIALIZE_ROOT/package.json" 2>/dev/null \
+            || cp "$REPO_DIR/package.json" "$MATERIALIZE_ROOT/package.json"
     else
-        files="$(git -C "$REPO_DIR" ls-files -- '*.js' '*.mjs')"
+        MATERIALIZE_LABEL="tracked"
+        files="$(git -C "$REPO_DIR" ls-files -- "$@")"
+        MATERIALIZE_ROOT=""
     fi
 
-    local count=0
     local file check_path
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
-        if [[ -n "$staged_root" ]]; then
-            # Read the staged blob (git show :<path>), not the working
-            # tree copy: a partially staged file (git add -p) can have
-            # unstaged edits on disk that differ from what is actually
-            # about to be committed, and this gate must judge the
-            # latter. `git show` is an external command, so `||
-            # continue` here is safe: it is only shell *functions*
-            # invoked in a test context (||, if, while) that run with
-            # -e silently suppressed for their entire body (see
-            # run_stage above); a plain external command has no such
-            # hazard.
-            check_path="$staged_root/$file"
+        if [[ -n "$MATERIALIZE_ROOT" ]]; then
+            # Judge the staged blob, not the working tree, so a
+            # partially staged file is judged on what is actually
+            # about to be committed. `git show` is an external
+            # command, so `|| continue` is safe here, unlike testing a
+            # shell function this way (see run_stage).
+            check_path="$MATERIALIZE_ROOT/$file"
             mkdir -p "$(dirname "$check_path")"
             git -C "$REPO_DIR" show ":$file" > "$check_path" 2>/dev/null || continue
         else
             [[ -f "$REPO_DIR/$file" ]] || continue
             check_path="$REPO_DIR/$file"
         fi
+        MATERIALIZE_PAIRS+=("$file"$'\t'"$check_path")
+    done <<< "$files"
+}
+
+function stage_syntax() {
+    materialize_candidates '*.js' '*.mjs'
+    local label="$MATERIALIZE_LABEL" staged_root="$MATERIALIZE_ROOT"
+
+    local count=0
+    local entry file check_path
+    for entry in "${MATERIALIZE_PAIRS[@]}"; do
+        file="${entry%%$'\t'*}"
+        check_path="${entry#*$'\t'}"
         count=$((count + 1))
         "$NODE_BIN" --check "$check_path"
-    done <<< "$files"
+    done
 
     if [[ -n "$staged_root" ]]; then
         rm -rf "$staged_root"
@@ -251,41 +270,22 @@ function stage_smoke() {
 function stage_dashes() {
     dash_self_test || { log_error "dashes: refusing to trust a broken detector"; return 1; }
 
-    local label="tracked"
-    local files
-    local staged_root=""
-    if [[ "$STAGED" -eq 1 ]]; then
-        label="staged"
-        files="$(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -- \
-            '*.js' '*.mjs' '*.md' '*.json' '*.sh' '*.yml' '.githooks/pre-commit' \
-            ':!:vendor/**' ':!:.slim/**' || true)"
-        staged_root="$(scratch_dir)"
-    else
-        files="$(git -C "$REPO_DIR" ls-files -- \
-            '*.js' '*.mjs' '*.md' '*.json' '*.sh' '*.yml' '.githooks/pre-commit' \
-            ':!:vendor/**' ':!:.slim/**')"
-    fi
+    materialize_candidates \
+        '*.js' '*.mjs' '*.md' '*.json' '*.sh' '*.yml' '.githooks/pre-commit' \
+        ':!:vendor/**' ':!:.slim/**'
+    local label="$MATERIALIZE_LABEL" staged_root="$MATERIALIZE_ROOT"
 
     local offenders=""
     local count=0
-    local file scan_path
-    while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-        if [[ -n "$staged_root" ]]; then
-            # Same reasoning as stage_syntax above: judge the staged
-            # blob, not whatever is currently sitting on disk.
-            scan_path="$staged_root/$file"
-            mkdir -p "$(dirname "$scan_path")"
-            git -C "$REPO_DIR" show ":$file" > "$scan_path" 2>/dev/null || continue
-        else
-            [[ -f "$REPO_DIR/$file" ]] || continue
-            scan_path="$REPO_DIR/$file"
-        fi
+    local entry file scan_path
+    for entry in "${MATERIALIZE_PAIRS[@]}"; do
+        file="${entry%%$'\t'*}"
+        scan_path="${entry#*$'\t'}"
         count=$((count + 1))
         if file_has_dash "$scan_path"; then
             offenders+="$file"$'\n'
         fi
-    done <<< "$files"
+    done
 
     if [[ -n "$staged_root" ]]; then
         rm -rf "$staged_root"
@@ -308,8 +308,12 @@ function stage_skeleton() {
             return 0
             ;;
         2)
-            log_warn "skeleton: sibling repo directory not found; SKIPPING the skeleton check"
+            log_warn "skeleton: sibling repo directory not found; SKIPPING the skeleton check (set \$MIGHTY_SIBLING_DIR or pass --sibling to scripts/sync-skeleton.sh to make this stage run)"
             return 2
+            ;;
+        3)
+            log_error "skeleton: ambiguous sibling, more than one mighty-* candidate found (see candidates above); pass --sibling <dir> or set \$MIGHTY_SIBLING_DIR to pick one"
+            return 1
             ;;
         *)
             log_error "skeleton: drift found between this repo and the sibling (diff above)"
@@ -318,17 +322,12 @@ function stage_skeleton() {
     esac
 }
 
-# run_stage <name> - runs stage_<name> and turns its exit code into a
-# one-line PASS/SKIP/FAIL summary, exiting on FAIL.
-#
-# The stage is run as `( set -e; stage_fn )` rather than plain
-# `stage_fn || rc=$?`: a function call on the left of `||` (or inside an
-# `if`/`while` test) runs with -e suppressed for every command in its
-# *entire* body, not just the top-level call, which is exactly the trap
-# that let a crashing node/bun smoke run still log "passed" and return
-# 0 here. A fresh `( set -e; ... )` subshell re-enables -e for the
-# stage's own commands while still letting this function observe and
-# react to its exit code afterwards instead of being torn down by it.
+# run_stage <name> - runs stage_<name>, turning its exit code into a
+# one-line PASS/SKIP/FAIL summary and exiting on FAIL. Runs the stage
+# inside `( set -e; ... )`: a function tested by `||`/`if`/`while` (as
+# this call itself is) runs with -e suppressed for its entire body, so
+# a fresh subshell is the only reliable way to both enforce -e inside
+# the stage and still observe its exit code out here.
 function run_stage() {
     local name="$1"
     local rc=0
@@ -338,7 +337,10 @@ function run_stage() {
     set -e
     case "$rc" in
         0) log_info "[check] PASS: $name" ;;
-        2) log_warn "[check] SKIP: $name" ;;
+        2)
+            log_warn "[check] SKIP: $name"
+            SKIPPED_STAGES+=("$name")
+            ;;
         *)
             log_error "[check] FAIL: $name"
             exit 1
@@ -392,7 +394,11 @@ function main() {
         run_stage "$s"
     done
 
-    log_info "check.sh: all requested stages passed (${stages[*]})"
+    if [[ "${#SKIPPED_STAGES[@]}" -gt 0 ]]; then
+        log_info "check.sh: all requested stages passed (skipped: ${SKIPPED_STAGES[*]})"
+    else
+        log_info "check.sh: all requested stages passed (${stages[*]})"
+    fi
 }
 
 main "$@"

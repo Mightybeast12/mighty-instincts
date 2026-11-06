@@ -29,7 +29,9 @@ set -euo pipefail
 # Exit codes: 0 ok / no drift, 1 drift found (--check) or a hard error,
 # 2 (only from --check) the sibling directory could not be found at
 # all, so scripts/check.sh's skeleton stage skips with a notice instead
-# of failing outright.
+# of failing outright, 3 more than one sibling candidate was found
+# (ambiguous, from either --check or --apply): scripts/check.sh's
+# skeleton stage FAILs on 3 rather than skipping.
 #
 # The skeleton set:
 #   scripts/release.sh
@@ -84,31 +86,19 @@ function pkg_name_of() {
 }
 
 # guess_sibling_dir <this-pkg-name> - finds a default sibling directory
-# when neither --sibling nor $MIGHTY_SIBLING_DIR says otherwise, without
-# ever hardcoding either repo's package name as a literal string.
+# when neither --sibling nor $MIGHTY_SIBLING_DIR says otherwise. Never
+# hardcode either repo's package name here: --apply's blind find/replace
+# runs over every skeleton file, including this one, so a literal name
+# written here would be corrupted the moment this file is copied.
 #
-# An earlier version of this function was a two-branch case statement
-# mapping this repo's package name to the sibling's and back, written
-# as literal strings. That is exactly the kind of text --apply's blind
-# find/replace exists to rewrite, and sync-skeleton.sh is itself one of
-# the files --apply copies: swapping every occurrence of this repo's
-# own name for the sibling's, across the whole file, turned both case
-# branches into the same self-referencing "the sibling's name maps to
-# the sibling's own name", so the copy that landed in the sibling
-# resolved its own "sibling" directory to itself, and --check there
-# always diffed the sibling against itself, reporting "no drift" no
-# matter what had actually changed.
-#
-# Scanning for a directory instead of naming one avoids that entirely:
-# nothing below ever writes down either repo's actual package name, so
-# there is nothing for the swap to corrupt. The "mighty-*" glob is a
-# directory-naming convention, not a full package name, so it is never
-# an exact match for a --apply swap target either.
+# Returns 0 and echoes the directory on exactly one match, 1 when none
+# is found, or 3 when more than one distinct candidate matches (after
+# printing every candidate to stderr): never guess among several.
 function guess_sibling_dir() {
     local this_pkg_name="$1"
     local parent_dirs=("$REPO_DIR/.." "$HOME/dev")
-    local found=""
-    local parent candidate_glob candidate name
+    local -a candidates=()
+    local parent candidate_glob candidate name already c
     for parent in "${parent_dirs[@]}"; do
         [[ -d "$parent" ]] || continue
         for candidate_glob in "$parent"/mighty-*; do
@@ -119,16 +109,26 @@ function guess_sibling_dir() {
             [[ "$candidate" == "$REPO_DIR" ]] && continue
             name="$(pkg_name_of "$candidate" 2>/dev/null)" || continue
             [[ -n "$name" && "$name" != "$this_pkg_name" ]] || continue
-            if [[ -n "$found" && "$found" != "$candidate" ]]; then
-                # More than one distinct candidate: ambiguous, refuse to
-                # guess rather than silently pick one.
-                return 1
-            fi
-            found="$candidate"
+            already=0
+            for c in "${candidates[@]:-}"; do
+                [[ "$c" == "$candidate" ]] && already=1
+            done
+            [[ "$already" -eq 1 ]] && continue
+            candidates+=("$candidate")
         done
     done
-    [[ -n "$found" ]] || return 1
-    echo "$found"
+
+    if [[ "${#candidates[@]}" -eq 0 ]]; then
+        return 1
+    fi
+    if [[ "${#candidates[@]}" -gt 1 ]]; then
+        log_error "sync-skeleton: ambiguous sibling, more than one mighty-* candidate found:"
+        for c in "${candidates[@]}"; do
+            echo "  $c" >&2
+        done
+        return 3
+    fi
+    echo "${candidates[0]}"
 }
 
 MODE=""
@@ -235,8 +235,13 @@ function write_with_name_swap() {
 }
 
 function do_check() {
-    local sibling_dir
-    if ! sibling_dir="$(resolve_sibling_dir)"; then
+    local sibling_dir rc=0
+    sibling_dir="$(resolve_sibling_dir)" || rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+        log_error "sync-skeleton: refusing to guess which is the sibling; pass --sibling <dir> or set \$MIGHTY_SIBLING_DIR"
+        exit 3
+    fi
+    if [[ "$rc" -ne 0 ]]; then
         log_warn "sync-skeleton: sibling repo directory not found (tried --sibling, \$MIGHTY_SIBLING_DIR, ../<sibling>, ~/dev/<sibling>)"
         exit 2
     fi
@@ -281,8 +286,13 @@ function do_check() {
 }
 
 function do_apply() {
-    local sibling_dir
-    if ! sibling_dir="$(resolve_sibling_dir)"; then
+    local sibling_dir rc=0
+    sibling_dir="$(resolve_sibling_dir)" || rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+        log_error "sync-skeleton: refusing to guess which is the sibling; pass --sibling <dir> or set \$MIGHTY_SIBLING_DIR"
+        exit 3
+    fi
+    if [[ "$rc" -ne 0 ]]; then
         log_error "sync-skeleton: sibling repo directory not found (tried --sibling, \$MIGHTY_SIBLING_DIR, ../<sibling>, ~/dev/<sibling>)"
         exit 1
     fi

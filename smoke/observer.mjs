@@ -14,7 +14,7 @@ import { DEFAULT_OPTIONS, validateOptions } from "../lib/plugin.js";
 
 export async function run({ assert, makeProjectAndData }) {
   await testFailureBackoff({ assert, makeProjectAndData });
-  await testAfterRunSkippedOnThrow({ assert, makeProjectAndData });
+  await testAfterRunGating({ assert, makeProjectAndData });
   await testDiskErrorDuringWrite({ assert, makeProjectAndData });
   await testModelUnset({ assert, makeProjectAndData });
   await testZeroWriteDamper({ assert, makeProjectAndData });
@@ -35,6 +35,29 @@ async function addLines(project, count, offset = 0) {
       input: `line-${offset + i}`,
     });
   }
+}
+
+// Runs `fn` with console.warn replaced by a collector, for a fixture
+// that deliberately induces a failure lib/observer.js's own catch
+// blocks (maybeRun's, in particular) report through console.warn:
+// without this, that expected failure's Error object (and its full
+// stack trace) prints into the suite's own output, which reads as a
+// crash even though every assertion below still passes. console.warn
+// is always restored, even if `fn` throws, so this never changes what
+// a real run logs; it only keeps a deliberately induced test failure
+// out of the suite's own printed output.
+async function withCapturedWarnings(fn) {
+  const captured = [];
+  const original = console.warn;
+  console.warn = (...args) => {
+    captured.push(args.map((arg) => (arg instanceof Error ? arg.message : String(arg))).join(" "));
+  };
+  try {
+    await fn();
+  } finally {
+    console.warn = original;
+  }
+  return captured.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -74,8 +97,13 @@ async function testFailureBackoff({ assert, makeProjectAndData }) {
   const project = await resolveProject(ctx, options);
   await addLines(project, 3);
 
-  await observer.maybeRun("obs-session");
+  // The model throw below is expected: maybeRun's own catch reports it
+  // through console.warn, which would otherwise print the full Error
+  // (and its stack) into the suite's own output for a failure this
+  // test deliberately causes.
+  const firstFailureWarning = await withCapturedWarnings(() => observer.maybeRun("obs-session"));
   assert.equal(generateCalls, 1, "the first maybeRun past threshold calls the model once");
+  assert.ok(firstFailureWarning.includes("the model is unavailable"), `the expected failure's console.warn is captured, not printed: ${firstFailureWarning}`);
 
   const afterFirstFailure = await readObserverState(project.project_dir);
   assert.equal(afterFirstFailure.failures, 1, "one consecutive failure recorded");
@@ -113,45 +141,104 @@ async function testFailureBackoff({ assert, makeProjectAndData }) {
 }
 
 // ---------------------------------------------------------------------------
-// 1a. afterRun (board refresh + forced maintenance) only runs once a
-//     generate.text call has resolved without throwing.
+// 1a. afterRun (board refresh + forced maintenance) only runs once a run
+//     actually reached the model call and completed it: never on a
+//     thrown ctx.generate.text call, never on the "no observations"
+//     early return, and never on the observer.model-unset early return
+//     (those last two never even call the model).
 // ---------------------------------------------------------------------------
-async function testAfterRunSkippedOnThrow({ assert, makeProjectAndData }) {
-  const { projectDir, dataDir } = makeProjectAndData("observer-afterrun");
-  const options = {
-    python: "python3",
-    dataDir,
-    observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 0, minObservations: 1, maxAnalysisLines: 300, notify: false },
-  };
-  let shouldThrow = true;
-  const ctx = {
-    location: { directory: projectDir },
-    generate: {
-      text: async () => {
-        if (shouldThrow) throw new Error("boom");
-        return { text: "<none/>" };
+async function testAfterRunGating({ assert, makeProjectAndData }) {
+  // --- a thrown ctx.generate.text call --------------------------------
+  {
+    const { projectDir, dataDir } = makeProjectAndData("observer-afterrun-throw");
+    const options = {
+      python: "python3",
+      dataDir,
+      observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 0, minObservations: 1, maxAnalysisLines: 300, notify: false },
+    };
+    let shouldThrow = true;
+    const ctx = {
+      location: { directory: projectDir },
+      generate: {
+        text: async () => {
+          if (shouldThrow) throw new Error("boom");
+          return { text: "<none/>" };
+        },
       },
-    },
-    session: { synthetic: async () => ({}) },
-  };
-  let afterRunCalls = 0;
-  const observer = createObserver(ctx, options, { afterRun: async () => { afterRunCalls += 1; } });
-  const project = await resolveProject(ctx, options);
-  await addLines(project, 1);
+      session: { synthetic: async () => ({}) },
+    };
+    let afterRunCalls = 0;
+    const observer = createObserver(ctx, options, { afterRun: async () => { afterRunCalls += 1; } });
+    const project = await resolveProject(ctx, options);
+    await addLines(project, 1);
 
-  let threw = false;
-  try {
+    let threw = false;
+    try {
+      await observer.run("s1", { notify: false });
+    } catch (error) {
+      threw = true;
+      assert.ok(error.message.includes("run failed"), `the re-thrown error carries the streak info: ${error.message}`);
+    }
+    assert.ok(threw, "run() re-throws after ctx.generate.text throws");
+    assert.equal(afterRunCalls, 0, "afterRun is skipped after a run that threw");
+
+    shouldThrow = false;
     await observer.run("s1", { notify: false });
-  } catch (error) {
-    threw = true;
-    assert.ok(error.message.includes("run failed"), `the re-thrown error carries the streak info: ${error.message}`);
+    assert.equal(afterRunCalls, 1, "afterRun runs after a run that reached the model call and completed");
   }
-  assert.ok(threw, "run() re-throws after ctx.generate.text throws");
-  assert.equal(afterRunCalls, 0, "afterRun is skipped after a run that threw");
 
-  shouldThrow = false;
-  await observer.run("s1", { notify: false });
-  assert.equal(afterRunCalls, 1, "afterRun runs after a run that resolved normally");
+  // --- the "no observations" early return: never reaches the model ---
+  {
+    const { projectDir, dataDir } = makeProjectAndData("observer-afterrun-empty");
+    const options = {
+      python: "python3",
+      dataDir,
+      observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 0, minObservations: 1, maxAnalysisLines: 300, notify: false },
+    };
+    const ctx = {
+      location: { directory: projectDir },
+      generate: {
+        text: async () => {
+          throw new Error("must never be called: there is nothing to analyse");
+        },
+      },
+      session: { synthetic: async () => ({}) },
+    };
+    let afterRunCalls = 0;
+    const observer = createObserver(ctx, options, { afterRun: async () => { afterRunCalls += 1; } });
+    await resolveProject(ctx, options); // no observations appended at all
+
+    const summary = await observer.run("s1", { notify: false });
+    assert.ok(summary.includes("No observations recorded yet"), "the empty-observations early return still returns its own summary");
+    assert.equal(afterRunCalls, 0, "afterRun never fires on a run that found nothing to analyse, so it never forces a board refresh plus a full maintenance sweep for nothing");
+  }
+
+  // --- the observer.model-unset early return: never reaches the model
+  {
+    const { projectDir, dataDir } = makeProjectAndData("observer-afterrun-model-unset");
+    const options = {
+      python: "python3",
+      dataDir,
+      observer: { enabled: true, model: undefined, runIntervalMinutes: 0, minObservations: 1, maxAnalysisLines: 300, notify: false },
+    };
+    const ctx = {
+      location: { directory: projectDir },
+      generate: {
+        text: async () => {
+          throw new Error("must never be called: observer.model is unset");
+        },
+      },
+      session: { synthetic: async () => ({}) },
+    };
+    let afterRunCalls = 0;
+    const observer = createObserver(ctx, options, { afterRun: async () => { afterRunCalls += 1; } });
+    const project = await resolveProject(ctx, options);
+    await addLines(project, 1);
+
+    const summary = await observer.run("s1", { notify: false });
+    assert.ok(summary.includes("observer.model"), "the model-unset early return still returns its own sentence");
+    assert.equal(afterRunCalls, 0, "afterRun never fires on a run that never reached the model call");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +249,14 @@ async function testAfterRunSkippedOnThrow({ assert, makeProjectAndData }) {
 //     model itself returned a perfectly valid block.
 // ---------------------------------------------------------------------------
 async function testDiskErrorDuringWrite({ assert, makeProjectAndData }) {
+  // chmod 0o500 (below) is meaningless to root, which ignores file
+  // permission bits entirely, so the write would succeed and this
+  // fixture's whole premise (an EACCES disk error) would never happen.
+  if (process.getuid?.() === 0) {
+    console.log("smoke/observer.mjs: skipping testDiskErrorDuringWrite (running as root, which ignores file permissions)");
+    return;
+  }
+
   const { projectDir, dataDir } = makeProjectAndData("observer-disk-error");
   const options = {
     python: "python3",
@@ -206,14 +301,21 @@ async function testDiskErrorDuringWrite({ assert, makeProjectAndData }) {
   await fs.chmod(project.instincts_personal, 0o500);
 
   const observer = createObserver(ctx, options);
+  let warning = "";
   try {
     // maybeRun (the background path, same as a thrown ctx.generate.text
     // call): the error is caught and logged internally, never thrown out
-    // to the caller.
-    await observer.maybeRun("s1");
+    // to the caller, but reported through console.warn, which is
+    // expected here and captured instead of printed (see
+    // withCapturedWarnings above).
+    warning = await withCapturedWarnings(() => observer.maybeRun("s1"));
   } finally {
     await fs.chmod(project.instincts_personal, 0o700);
   }
+  assert.ok(
+    warning.includes("EACCES") || warning.toLowerCase().includes("permission denied"),
+    `the expected write failure's console.warn is captured, not printed: ${warning}`,
+  );
 
   const state = await readObserverState(project.project_dir);
   assert.equal(state.failures, 1, "the write failure is recorded in the backoff state, same as a thrown generate.text call");

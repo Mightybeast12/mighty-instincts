@@ -89,6 +89,29 @@ export async function run({ assert, makeProjectAndData, TEMP_ROOT }) {
     assert.equal(modelUnsetState.instincts.nextRunReady, false, "the model-unset hold keeps nextRunReady false even though the interval and observation-count gates both pass");
     const modelUnsetBlock = buildInstinctsBlock(modelUnsetState.instincts);
     assert.ok(modelUnsetBlock.rows.some((row) => row.hint === "learning paused: set observer.model"), "blocked: model-unset gets its own hint row through the real pipeline too");
+
+    // Non-latching: a stale blocked: "model-unset" must clear as soon as
+    // observer.model is actually set again, not just once the observer
+    // itself next runs successfully and rewrites the state file.
+    const { projectDir: clearedDir, dataDir: clearedData } = makeProjectAndData("board-model-cleared");
+    const clearedOptions = {
+      python: "python3",
+      dataDir: clearedData,
+      observer: { enabled: true, model: "fakeprov/fakemodel", runIntervalMinutes: 5, minObservations: 5 },
+      board: { enabled: true },
+    };
+    const clearedCtx = { location: { directory: clearedDir } };
+    const clearedProject = await resolveProject(clearedCtx, clearedOptions);
+    await fs.mkdir(clearedProject.project_dir, { recursive: true });
+    await fs.writeFile(
+      path.join(clearedProject.project_dir, ".observer-state.json"),
+      JSON.stringify({ lastRunAt: new Date(Date.now() - 3600000).toISOString(), lastLineCount: 0, lastAttemptAt: null, failures: 0, nextAttemptAfter: null, blocked: "model-unset", lastWrittenCounts: [] }),
+      "utf8",
+    );
+    const clearedState = await refreshBoardState(clearedCtx, clearedOptions);
+    assert.equal(clearedState.instincts.blocked, null, "a stale blocked: model-unset clears once observer.model is set, even before the observer has run again");
+    const clearedBlock = buildInstinctsBlock(clearedState.instincts);
+    assert.ok(!clearedBlock.rows.some((row) => row.hint === "learning paused: set observer.model"), "the hint row disappears along with the field");
   }
 
   // -------------------------------------------------------------------------
@@ -183,28 +206,29 @@ export async function run({ assert, makeProjectAndData, TEMP_ROOT }) {
 
   // -------------------------------------------------------------------------
   // collectHealth: a bogus python path, a configured-but-missing
-  // observationsRoot, and options._warnings passed straight through; and
-  // the model-unset warning clears once observer.model is set even though
-  // a stale .observer-state.json still says blocked: "model-unset" (it
-  // must never latch).
+  // observationsRoot, and explicit `warnings` passed straight through
+  // (never through options); and the model-unset warning clears once
+  // observer.model is set even though a stale .observer-state.json still
+  // says blocked: "model-unset" (it must never latch).
   // -------------------------------------------------------------------------
   {
     _resetPythonProbeCache();
     const bogusPython = path.join(TEMP_ROOT, "no-such-python-binary-at-all");
     const missingRoot = path.join(TEMP_ROOT, "no-such-observations-root");
     const health = await collectHealth({
-      options: { python: bogusPython, board: { observationsRoot: missingRoot }, _warnings: ["option 'foo' is not recognised"] },
+      options: { python: bogusPython, board: { observationsRoot: missingRoot } },
       project: null,
       observerState: null,
       observationsRoot: missingRoot,
       evalRoots: [],
+      warnings: ["option 'foo' is not recognised"],
     });
     assert.ok(health.some((entry) => entry.key === "python" && entry.level === "attention"), "a python binary that cannot even be spawned reads as a health entry");
     assert.ok(
       health.some((entry) => entry.key === "observations-root" && entry.message.includes(missingRoot)),
       "a configured-but-missing observationsRoot reads as its own health entry naming the path",
     );
-    assert.ok(health.some((entry) => entry.key === "warning-0" && entry.message === "option 'foo' is not recognised"), "options._warnings entries pass through verbatim");
+    assert.ok(health.some((entry) => entry.key === "warning-0" && entry.message === "option 'foo' is not recognised"), "the explicit warnings argument passes through verbatim");
 
     // Non-latching: a stale blocked: "model-unset" in observerState must
     // never override the model actually being set right now.

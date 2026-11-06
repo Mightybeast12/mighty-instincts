@@ -52,10 +52,13 @@ import {
 // os.tmpdir() resolves under /private/var/folders in the sandboxes this
 // plugin is developed in; nesting under opencode/instincts-test keeps every
 // fixture this file creates inside that approved scratch area instead of
-// scattering directories across the bare temp root.
-const TEMP_ROOT = path.join(os.tmpdir(), "opencode", "instincts-test", "smoke");
-fsSync.rmSync(TEMP_ROOT, { recursive: true, force: true });
-fsSync.mkdirSync(TEMP_ROOT, { recursive: true });
+// scattering directories across the bare temp root. Each run gets its own
+// directory, so two suites running at once (node and bun, or two
+// checkouts) never delete each other's fixtures; it is removed on exit.
+const TEMP_PARENT = path.join(os.tmpdir(), "opencode", "instincts-test");
+fsSync.mkdirSync(TEMP_PARENT, { recursive: true });
+const TEMP_ROOT = fsSync.mkdtempSync(path.join(TEMP_PARENT, "smoke-"));
+process.on("exit", () => fsSync.rmSync(TEMP_ROOT, { recursive: true, force: true }));
 
 function makeProjectAndData(label) {
   const root = fsSync.mkdtempSync(path.join(TEMP_ROOT, `${label}-`));
@@ -269,16 +272,18 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
       "evolve-list",
       "evolve-reject",
       "evolve-show",
+      "instinct",
       "instinct-export",
       "instinct-import",
       "instinct-observe",
       "instinct-projects",
       "instinct-prune",
       "instinct-status",
+      "maintain",
       "promote",
       "skill-review",
     ].sort(),
-    "all fifteen slash commands registered",
+    "all seventeen slash commands registered",
   );
   assert.equal(harness.toolDefs.length, 1, "one tool registered");
   assert.equal(harness.toolDefs[0].id, "instincts", "tool id is instincts");
@@ -2526,7 +2531,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     assert.ok(/fired:\s*1/.test(content), "two requests carrying the same latest user message (simulating tool-call steps within one turn) bump fired exactly once, not twice");
 
     const activity = JSON.parse(await fs.readFile(path.join(project.project_dir, ".activity.json"), "utf8"));
-    assert.equal(activity.appliedToday, 2, "injection itself still runs on every request: both requests counted in appliedToday");
+    assert.equal(activity.appliedToday, 1, "injection itself still runs on every request, but appliedToday only counts the first of the two identical-text requests");
     assert.equal(activity.firedToday, 1, "firedToday only counts the first of the two identical-text requests");
   }
 
