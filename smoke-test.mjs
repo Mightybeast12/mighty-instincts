@@ -15,6 +15,7 @@ import { resolveProject, siblingInstinctsDir } from "./lib/project.js";
 import { appendObservation, writeInstinct } from "./lib/store.js";
 import { runCli } from "./lib/cli.js";
 import { PKG_NAME } from "./lib/pkg.js";
+import { noticeDescription } from "./lib/util.js";
 import {
   MAINTENANCE_DEFAULTS,
   classifyNewInstinct,
@@ -419,7 +420,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(statusReply, "instinct-status posted a synthetic reply");
   assert.equal(statusReply.resume, true, "a typed command's reply resumes immediately instead of waiting for the next turn");
   assert.equal(statusReply.delivery, "queue");
-  assert.equal(statusReply.description, PKG_NAME);
+  assert.ok(
+    statusReply.description.startsWith(`${PKG_NAME} \u00b7 `),
+    "the chat row's description leads with the package name, not just the bare PKG_NAME the TUI used to show",
+  );
+  assert.ok(
+    statusReply.description.includes("No instincts found"),
+    `the chat row's description carries the status text, not just the package name: ${statusReply.description}`,
+  );
   assert.ok(statusReply.text.includes("No instincts found"), "status reflects the empty instinct store");
   assert.equal(harness.promptCalls.length, 0, "ctx.session.prompt is never called");
 
@@ -544,6 +552,11 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     assert.equal(call.delivery, "queue");
     assert.ok(call.text.startsWith(`(part ${index + 1} of ${parts.length})\n`), `message ${index} carries its own '(part N of M)' prefix`);
     assert.ok(call.text.includes(parts[index]), "the message's own part is wrapped in the usual code fence");
+    assert.equal(
+      call.description,
+      noticeDescription(`(part ${index + 1} of ${parts.length})\n${parts[index]}`),
+      "each part's chat row carries that part's own '(part N of M)' label and content, not just the bare package name",
+    );
   });
 
   // Short output (the common case) still posts as exactly one message,
@@ -649,6 +662,14 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.equal(notice.resume, false);
   assert.equal(notice.delivery, "queue");
   assert.ok(notice.text.includes("1 written, 3 rejected"), "notify summary matches the log line");
+  assert.ok(
+    notice.description.startsWith(`${PKG_NAME} \u00b7 `),
+    "the chat row's description leads with the package name, not just the bare PKG_NAME the TUI used to show",
+  );
+  assert.ok(
+    notice.description.includes("1 written, 3 rejected"),
+    `the chat row's description carries the notify summary, not just the package name: ${notice.description}`,
+  );
 
   // The run above just wrote lastRunAt into .observer-state.json; a fresh
   // observer instance for the same project must now reject on the interval
@@ -4005,6 +4026,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const eventBus = createFakeEventBus();
   const createCalls = [];
   const promptCalls = [];
+  const syntheticCalls = [];
   let afterRunCalls = 0;
 
   const fakeCtx = {
@@ -4018,7 +4040,10 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
         promptCalls.push(input);
         return {};
       },
-      synthetic: async () => ({}),
+      synthetic: async (input) => {
+        syntheticCalls.push(input);
+        return {};
+      },
       get: async () => {
         throw new Error("session.get should not be polled while the event bridge is available");
       },
@@ -4033,7 +4058,7 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
     },
   });
 
-  const firstRun = await controller.run({ force: true });
+  const firstRun = await controller.run({ force: true, sessionID: "review-reply-session" });
   assert.equal(firstRun.spawned, true);
   assert.equal(firstRun.sessionID, "ses_review1");
   assert.equal(createCalls.length, 1, "exactly one session.create call");
@@ -4052,10 +4077,33 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const runsLogAfterStart = await fs.readFile(runsLogPath, "utf8");
   assert.ok(runsLogAfterStart.includes("started session ses_review1"));
 
+  // reply()'s synthetic notice: description carries the one-line reply
+  // text (the only thing the OpenCode 2 chat row shows), text is unchanged.
+  const startedReply = syntheticCalls.find((call) => call.sessionID === "review-reply-session");
+  assert.ok(startedReply, "the forced run posted a reply to the given sessionID");
+  assert.ok(startedReply.text.startsWith("Skill review started in session ses_review1"), `reply text: ${startedReply.text}`);
+  assert.equal(
+    startedReply.description,
+    noticeDescription(startedReply.text),
+    "the chat row's description carries the reply text, not just the bare package name",
+  );
+  assert.ok(
+    startedReply.description.includes("Skill review started in session ses_review1"),
+    `the chat row's description carries the reply text: ${startedReply.description}`,
+  );
+
   // A second forced run while the lock is live spawns nothing further.
-  const secondRun = await controller.run({ force: true });
+  const secondRun = await controller.run({ force: true, sessionID: "review-reply-session" });
   assert.equal(secondRun.spawned, false);
   assert.equal(createCalls.length, 1, "still exactly one session.create call");
+
+  const notStartedReply = syntheticCalls.filter((call) => call.sessionID === "review-reply-session").at(-1);
+  assert.ok(notStartedReply.text.startsWith("Skill review not started:"), `reply text: ${notStartedReply.text}`);
+  assert.equal(
+    notStartedReply.description,
+    noticeDescription(notStartedReply.text),
+    "the second run's 'not started' reply also carries its text in the chat row's description",
+  );
 
   // Simulate the review session finishing: the test writes
   // last-review-date.txt itself (standing in for the real session's own
@@ -4161,6 +4209,51 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.ok(`${failing.stdout}${failing.stderr}`.includes("https://ci/pushed"), "the gate reports the pushed commit's run, not the previous one");
   const passing = runGate("success");
   assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
+}
+
+// ---------------------------------------------------------------------------
+// 26. lib/util.js's noticeDescription: the human-facing content the
+//     OpenCode 2 TUI's chat row shows for a synthetic notice (it renders
+//     only `description`, never `text`, see SessionNoticeMessageV2 in
+//     packages/tui/src/routes/session/index.tsx).
+// ---------------------------------------------------------------------------
+{
+  assert.equal(noticeDescription(""), PKG_NAME, "empty text falls back to the bare package name");
+  assert.equal(noticeDescription(null), PKG_NAME, "null text falls back to the bare package name");
+  assert.equal(noticeDescription(undefined), PKG_NAME, "undefined text falls back to the bare package name");
+
+  assert.equal(
+    noticeDescription("Skill review started in session ses_review1."),
+    `${PKG_NAME} \u00b7 Skill review started in session ses_review1.`,
+    "a single line reads 'PKG_NAME . line', the only format the TUI used to show before this fix",
+  );
+  assert.equal(
+    noticeDescription("one line\n\n"),
+    `${PKG_NAME} \u00b7 one line`,
+    "trailing blank lines are dropped before deciding whether the text is single-line",
+  );
+
+  const multiLine = noticeDescription("2026-11-06T00:00:00.000Z run: 1 written, 3 rejected\nWritten: foo\nRejected: bar: baz");
+  assert.equal(
+    multiLine,
+    `${PKG_NAME} \u00b7 2026-11-06T00:00:00.000Z run: 1 written, 3 rejected\n  Written: foo\n  Rejected: bar: baz`,
+    "multi-line text keeps the lead line on the first row, every remaining line indented by two spaces",
+  );
+
+  const manyLines = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
+  const capped = noticeDescription(manyLines, 5);
+  const cappedLines = capped.split("\n");
+  assert.equal(cappedLines.length, 6, "5 kept lines plus the '+N more lines' summary line");
+  assert.equal(cappedLines[0], `${PKG_NAME} \u00b7 line 0`, "the lead line is always kept first");
+  assert.equal(cappedLines[1], "  line 1");
+  assert.equal(cappedLines[4], "  line 4");
+  assert.equal(cappedLines[5], "  +25 more lines", "25 of the 30 lines were dropped to fit maxLines: 5");
+
+  assert.equal(
+    noticeDescription("only one line", 1),
+    `${PKG_NAME} \u00b7 only one line`,
+    "a single-line input never grows a '+more lines' tail no matter how small maxLines is",
+  );
 }
 
 function buildFakeObserverOutput() {
