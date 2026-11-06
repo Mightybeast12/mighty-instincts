@@ -16,6 +16,8 @@
     "lib/",
     "vendor/",
     "README.md",
+    "docs/",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
   ],
