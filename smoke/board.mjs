@@ -382,6 +382,11 @@ export async function run({ assert, makeProjectAndData, TEMP_ROOT }) {
       }),
       "utf8",
     );
+    // The reader picks the newest benchmark by mtime; two writes in the
+    // same millisecond tie, so give the second file a later mtime
+    // explicitly instead of relying on the clock between the two writes.
+    const later = new Date(Date.now() + 5000);
+    await fs.utimes(path.join(secondIterationDir, "benchmark.json"), later, later);
     const secondResult = await readEvalsSummary([evalRoot]);
     assert.equal(secondResult.skill, "second", "a new iteration directory nested under an existing workspace is seen on the very next call, with no cache to bust");
   }
