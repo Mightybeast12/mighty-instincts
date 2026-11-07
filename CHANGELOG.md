@@ -2,7 +2,7 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
-## Unreleased
+## v0.11.0 (2026-11-07)
 
 - Read `prune.unusedDays` through one `resolveUnusedDays` helper everywhere.
 - Rewrite the README as a front door, move detail to docs/, add a CHANGELOG: README.md is the install page (defaults block, options table, command table, aliases, board, privacy, development); docs/ holds board, observer, evolve, instinct, maintenance, skill-review, data-layout and ecc; `smoke/readme.mjs` fails the suite when the README or docs drift from the code.
