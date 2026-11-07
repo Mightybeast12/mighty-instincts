@@ -172,22 +172,34 @@ async function testCommandNamesMatch({ assert, createPluginHarness, makeProjectA
 
 // ---------------------------------------------------------------------------
 // (c) Wherever README or any docs/*.md file shows a version string
-// (vX.Y.Z), it must name the current package.json version. Any of them
-// is free to show none at all; this only fails when one is present and
-// wrong, so a release bump that forgets an illustrative example (like
-// docs/board.md's panel header) is caught here.
+// as the panel header ("Mighty Instincts vX.Y.Z"), it must name the
+// current package.json version, and CHANGELOG.md's first entry must be
+// Unreleased or that same version, so a release that forgets either is
+// caught here.
 // ---------------------------------------------------------------------------
 async function testVersionStringsMatchPackageJson({ assert, readme, docsFiles }) {
   const pkg = JSON.parse(await fs.readFile(PACKAGE_JSON_PATH, "utf8"));
   const expected = `v${pkg.version}`;
+  // Only the panel-header example ("Mighty Instincts vX.Y.Z") means "the
+  // installed version"; other vX.Y.Z mentions in the docs are history
+  // ("from v0.10.0 and earlier") and must stay as they are.
   const checkOne = (label, content) => {
-    const versionMatches = [...content.matchAll(/\bv\d+\.\d+\.\d+\b/g)].map((match) => match[0]);
-    for (const found of versionMatches) {
-      assert.equal(found, expected, `${label} shows version string '${found}', which does not match package.json's current version '${expected}'`);
+    for (const match of content.matchAll(/Mighty Instincts (v\d+\.\d+\.\d+)/g)) {
+      assert.equal(match[1], expected, `${label} shows the panel header as '${match[1]}', which does not match package.json's current version '${expected}'`);
     }
   };
   checkOne("README.md", readme);
   for (const [name, content] of docsFiles) checkOne(`docs/${name}`, content);
+
+  // CHANGELOG.md's first entry is either the unreleased section or the
+  // released version itself (scripts/bump-version.sh renames one into the
+  // other during scripts/release.sh).
+  const changelog = await fs.readFile(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+  const firstHeading = changelog.split("\n").find((line) => line.startsWith("## "));
+  assert.ok(
+    firstHeading === "## Unreleased" || firstHeading?.startsWith(`## ${expected} (`),
+    `CHANGELOG.md's first entry is '${firstHeading}', expected '## Unreleased' or '## ${expected} (<date>)'`,
+  );
 }
 
 // ---------------------------------------------------------------------------

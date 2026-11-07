@@ -4,8 +4,8 @@ One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bull
 
 ## Unreleased
 
-Two commits on `main` since v0.10.0:
-
+- Read `prune.unusedDays` through one `resolveUnusedDays` helper everywhere.
+- Rewrite the README as a front door, move detail to docs/, add a CHANGELOG: README.md is the install page (defaults block, options table, command table, aliases, board, privacy, development); docs/ holds board, observer, evolve, instinct, maintenance, skill-review, data-layout and ecc; `smoke/readme.mjs` fails the suite when the README or docs drift from the code.
 - Add /instinct and /maintain families, skill review install, TUI evolve picker: `/instinct <verb>` replaces the five hyphenated commands (kept as deprecated aliases) with status/projects/export/import/observe plus why/keep/wrong/mute/unmute/observer on|off/doctor/help; `/maintain [--dry-run]` and `/maintain prune` run the sweep (or just the pending prune) on demand; `/promote` now uses the real `promoteStep` rule instead of the Python passthrough; `/skill-review install [n|all]` and `/skill-review undo` install or revert staged skill updates after a seed-vs-live check, with per-operation backups; the OpenCode 2 TUI's `/evolve` (no arguments) opens a pick-a-candidate/action/confirm dialog.
 - Unify /evolve, harden the observer, make the board actionable, add one CI gate: `/evolve` became one command (dashboard, detail, `<n|id> install|reject|archive`, `now`, `clusters`), replacing five separate commands kept as deprecated aliases; the observer's failures now back off 5/15/60 minutes and `observer.model` is required with a one-time notice; the board's hint rows name the exact command to run and gained a Health block; `scripts/check.sh` added as the one gate behind the pre-commit hook, `release.sh`, and CI.
 
