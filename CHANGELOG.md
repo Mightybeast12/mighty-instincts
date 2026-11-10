@@ -5,6 +5,7 @@ One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bull
 ## Unreleased
 
 - Name the running version on the first line of the instincts tool's status (`running: mighty-instincts@<version>`, the spec form `opencode.json` pins).
+- Add `/evolve purge`: lists, then on the same command again deletes, the draft files `/evolve` never lists (the CLI's `--generate` tree and stray files under `evolved/`); candidates of every status are kept.
 - Make the nested-iteration eval test independent of mtime resolution.
 
 ## v0.11.0 (2026-11-07)

@@ -88,7 +88,7 @@ Set `"maintenance": { "dryRun": true }` to see exactly what the next sweep would
 | Command | Does |
 | --- | --- |
 | `/board` | Show the instinct board summary as plain text. See [docs/board.md](docs/board.md). |
-| `/evolve [...]` | Dashboard, detail, install, reject, archive, 'now', and 'clusters' for evolve candidates (run with no arguments for the grammar's own dashboard). See [docs/evolve.md](docs/evolve.md). |
+| `/evolve [...]` | Dashboard, detail, install, reject, archive, 'now', 'clusters', and 'purge' (delete the drafts it does not list) for evolve candidates (run with no arguments for the grammar's own dashboard). See [docs/evolve.md](docs/evolve.md). |
 | `/instinct [...]` | ECC instinct status, per-habit feedback (keep/wrong/mute/unmute), the observer's on/off switch, doctor, and why (what got injected). Run with no arguments, or 'help', for the full verb list. See [docs/instinct.md](docs/instinct.md). |
 | `/maintain [...]` | Run the maintenance sweep now (promote/prune/decay/evolve/repair/cleanup); `--dry-run` previews every step; `prune [--dry-run]` runs only the pending-instinct prune. See [docs/maintenance.md](docs/maintenance.md). |
 | `/promote [--yes]` | Preview (default) or run (`--yes`) promoting project-scoped instincts that qualify to global scope. See [docs/maintenance.md](docs/maintenance.md). |

@@ -22,6 +22,7 @@ export async function run({ assert, createPluginHarness, makeProjectAndData, TEM
   await testNowAndClusters({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT });
   await testCrlfRuleArchive({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT });
   await testUnreadableInstallTarget({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT });
+  await testPurge({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT });
 }
 
 // ---------------------------------------------------------------------------
@@ -383,4 +384,61 @@ async function testUnreadableInstallTarget({ assert, createPluginHarness, makePr
   } finally {
     await fs.chmod(skillFile, 0o644);
   }
+}
+
+// ---------------------------------------------------------------------------
+// purge: deletes the drafts /evolve itself never lists (the Python CLI's
+// --generate tree under evolved/skills|commands|agents/, evolved/archive/,
+// and flat .md files that are not candidates), after showing them once,
+// and never touches a candidate file of any status: an archived one is
+// the tombstone that stops the weekly sweep from proposing its cluster
+// again, and a proposed one has /evolve <n> reject.
+// ---------------------------------------------------------------------------
+async function testPurge({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT }) {
+  const { project, exec, seed } = await makeEvolveProject("evolve-purge", { makeProjectAndData, TEMP_ROOT, createPluginHarness });
+  const dir = project.evolved_dir;
+  await seed("skill", "cand-keep-proposed", "keep-proposed", ["m1", "m2", "m3"]);
+  await seed("rule", "cand-keep-archived", "keep-archived", ["m4", "m5"], "archived");
+  const write = async (rel, text) => {
+    await fs.mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
+    await fs.writeFile(path.join(dir, rel), text, "utf8");
+  };
+  await write("commands/a-generated-command.md", "---\ndescription: x\n---\n# a-generated-command\n");
+  await write("skills/a-generated-skill/SKILL.md", "---\nname: a-generated-skill\n---\n");
+  await write("agents/a-generated-agent.md", "---\ndescription: y\n---\n");
+  await write("archive/old-draft.md", "# Candidate skill: old\n");
+  await write("legacy-0abc1234.md", "# Candidate skill: Testing patterns\n\nCluster id: legacy-0abc1234\n");
+  const outside = path.join(path.dirname(dir), "outside-target.md");
+  await fs.writeFile(outside, "not a draft\n", "utf8");
+  await fs.symlink(outside, path.join(dir, "commands", "linked.md"));
+
+  assert.ok(parseEvolveArgs(["purge"]).verb === "purge" && !parseEvolveArgs(["purge"]).error, "'purge' needs no pick");
+  assert.ok(parseEvolveArgs(["purge", "2"]).error, "purge takes no pick");
+
+  const preview = await exec("evolve", "purge");
+  assert.ok(preview.includes("Run /evolve purge again to delete these 6 draft file(s)."), `the first purge only lists what it would delete: ${preview}`);
+  for (const rel of ["commands/a-generated-command.md", "skills/a-generated-skill/SKILL.md", "agents/a-generated-agent.md", "archive/old-draft.md", "legacy-0abc1234.md", "commands/linked.md"]) {
+    assert.ok(preview.includes(rel), `the preview names ${rel}`);
+  }
+  assert.ok(!preview.includes("cand-keep-proposed") && !preview.includes("cand-keep-archived"), "candidate files are never listed for purge");
+  await fs.access(path.join(dir, "commands", "a-generated-command.md"));
+
+  const done = await exec("evolve", "purge");
+  assert.ok(done.includes("Deleted 6 draft file(s)"), `the second, identical purge deletes: ${done}`);
+  for (const rel of ["commands", "skills", "agents", "archive", "legacy-0abc1234.md"]) {
+    await assert.rejects(fs.lstat(path.join(dir, rel)), `${rel} is gone, emptied directories included`);
+  }
+  assert.equal(await fs.readFile(outside, "utf8"), "not a draft\n", "a symlinked draft is removed as a link; its target is never touched");
+  assert.equal((await findCandidateById(dir, "cand-keep-proposed")).fields.status, "proposed", "a proposed candidate survives purge");
+  assert.equal((await findCandidateById(dir, "cand-keep-archived")).fields.status, "archived", "an archived tombstone survives purge");
+  assert.ok((await exec("evolve", "purge")).includes("No drafts to purge"), "a purge with nothing left says so");
+
+  // A listing that changed between the preview and the second call is
+  // shown again instead of deleted.
+  await write("commands/first.md", "x\n");
+  await exec("evolve", "purge");
+  await write("commands/second.md", "y\n");
+  const changed = await exec("evolve", "purge");
+  assert.ok(changed.includes("Run /evolve purge again to delete these 2 draft file(s)."), `a listing that changed since the preview is shown again, not deleted: ${changed}`);
+  await fs.access(path.join(dir, "commands", "first.md"));
 }

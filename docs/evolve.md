@@ -41,6 +41,7 @@ Token order is free (`/evolve install 2` is the same as `/evolve 2 install`); a 
 | `/evolve <n\|id> archive` | Archive any non-archived candidate; for an installed one, also removes the file it installed, but only when ownership and content still match exactly what was installed. |
 | `/evolve now` | Run the weekly `evolve` (propose/refresh candidates from today's clusters) and `pruneCandidates` maintenance steps immediately. |
 | `/evolve clusters [N]` | The deterministic preview (no model call, no `instinct-cli.py`) of today's top instinct clusters: member ids, average confidence, a "why" naming the words they share, and a suggested form sized by cluster. `--limit N` is also accepted. |
+| `/evolve purge` | Delete the draft files `/evolve` never lists: the vendored CLI's `evolve --generate` tree under `evolved/skills/`, `evolved/commands/` and `evolved/agents/`, any other subfolder of `evolved/`, and top-level `.md` files that are not candidates (`lib/candidates.js` `listStrayDrafts`). Look-before-leap like install: the first call lists them and deletes nothing; the same command again deletes them only when the listing is unchanged, and shows it again otherwise. Candidate files of every status are kept: an archived one is what stops the weekly step proposing its cluster again, and a proposed one has `reject`. |
 
 ### Look-before-leap install
 
