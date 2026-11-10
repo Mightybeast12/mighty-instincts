@@ -2,6 +2,11 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
+## Unreleased
+
+- Name the running version on the first line of the instincts tool's status (`running: mighty-instincts@<version>`, the spec form `opencode.json` pins).
+- Make the nested-iteration eval test independent of mtime resolution.
+
 ## v0.11.0 (2026-11-07)
 
 - Read `prune.unusedDays` through one `resolveUnusedDays` helper everywhere.
