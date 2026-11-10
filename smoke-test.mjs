@@ -475,11 +475,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   // status opens with the version this process runs, in the spec form
   // opencode.json pins (backlog B1 of the tooling reviewer), so a caller can
   // tell a stale session from the pin; the CLI's own output follows it.
+  // Labelled "plugin:", never "running", which a caller reads as a state.
   const statusText = await call({ action: "status" });
-  const runningLine = `running: mighty-instincts@${JSON.parse(fsSync.readFileSync(new URL("./package.json", import.meta.url), "utf8")).version}`;
+  const runningLine = `plugin: mighty-instincts@${JSON.parse(fsSync.readFileSync(new URL("./package.json", import.meta.url), "utf8")).version}`;
   assert.equal(statusText.split("\n")[0], runningLine, "tool status names the running version first");
+  assert.ok(!/\brunning\b/i.test(statusText.split("\n")[0]), "the version line carries no 'running' word");
   assert.ok(statusText.includes("No instincts found"), "tool status call reaches the real CLI");
-  assert.ok(!(await call({ action: "projects" })).startsWith("running: "), "only status carries the version line");
+  assert.ok(!(await call({ action: "projects" })).startsWith("plugin: "), "only status carries the version line");
   assert.equal(await call({ action: "import" }), "Action not permitted for the instincts tool: import");
   assert.equal(await call({ action: "status", args: "--force" }), "The instincts tool never passes --force.");
   assert.equal(
