@@ -10,7 +10,7 @@ import fs from "node:fs/promises";
 
 import { resolveProject } from "../lib/project.js";
 import { registerCommands } from "../lib/commands.js";
-import { parseEvolveArgs } from "../lib/evolve-command.js";
+import { createEvolveState, parseEvolveArgs, PURGE_CONFIRM_TTL_MS, runEvolve } from "../lib/evolve-command.js";
 import { findCandidateById, hashContent, renderCandidateBody, writeCandidate } from "../lib/candidates.js";
 import { writeInstinct } from "../lib/store.js";
 
@@ -387,15 +387,18 @@ async function testUnreadableInstallTarget({ assert, createPluginHarness, makePr
 }
 
 // ---------------------------------------------------------------------------
-// purge: deletes the drafts /evolve itself never lists (the Python CLI's
+// purge: moves the drafts /evolve itself never lists (the Python CLI's
 // --generate tree under evolved/skills|commands|agents/, evolved/archive/,
-// and flat .md files that are not candidates), after showing them once,
-// and never touches a candidate file of any status: an archived one is
-// the tombstone that stops the weekly sweep from proposing its cluster
-// again, and a proposed one has /evolve <n> reject.
+// and flat .md files that are not candidates) into
+// evolved/.purged-<time>/, after showing them once, and never touches a
+// candidate file of any status: an archived one is the tombstone that
+// stops the weekly sweep from proposing its cluster again, and a
+// proposed one has /evolve <n> reject. The confirmation holds for
+// PURGE_CONFIRM_TTL_MS and only for the exact listing shown (path, size,
+// mtime); a file that fails to move is reported, never thrown.
 // ---------------------------------------------------------------------------
 async function testPurge({ assert, createPluginHarness, makeProjectAndData, TEMP_ROOT }) {
-  const { project, exec, seed } = await makeEvolveProject("evolve-purge", { makeProjectAndData, TEMP_ROOT, createPluginHarness });
+  const { project, options, harness, exec, seed } = await makeEvolveProject("evolve-purge", { makeProjectAndData, TEMP_ROOT, createPluginHarness });
   const dir = project.evolved_dir;
   await seed("skill", "cand-keep-proposed", "keep-proposed", ["m1", "m2", "m3"]);
   await seed("rule", "cand-keep-archived", "keep-archived", ["m4", "m5"], "archived");
@@ -403,42 +406,96 @@ async function testPurge({ assert, createPluginHarness, makeProjectAndData, TEMP
     await fs.mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
     await fs.writeFile(path.join(dir, rel), text, "utf8");
   };
-  await write("commands/a-generated-command.md", "---\ndescription: x\n---\n# a-generated-command\n");
-  await write("skills/a-generated-skill/SKILL.md", "---\nname: a-generated-skill\n---\n");
-  await write("agents/a-generated-agent.md", "---\ndescription: y\n---\n");
-  await write("archive/old-draft.md", "# Candidate skill: old\n");
-  await write("legacy-0abc1234.md", "# Candidate skill: Testing patterns\n\nCluster id: legacy-0abc1234\n");
+  const purgedDirs = async () => (await fs.readdir(dir)).filter((name) => name.startsWith(".purged-"));
+  const rels = ["commands/a-generated-command.md", "skills/a-generated-skill/SKILL.md", "agents/a-generated-agent.md", "archive/old-draft.md", "legacy-0abc1234.md", "commands/linked.md"];
+  await write(rels[0], "---\ndescription: x\n---\n# a-generated-command\n");
+  await write(rels[1], "---\nname: a-generated-skill\n---\n");
+  await write(rels[2], "---\ndescription: y\n---\n");
+  await write(rels[3], "# Candidate skill: old\n");
+  await write(rels[4], "# Candidate skill: Testing patterns\n\nCluster id: legacy-0abc1234\n");
   const outside = path.join(path.dirname(dir), "outside-target.md");
   await fs.writeFile(outside, "not a draft\n", "utf8");
-  await fs.symlink(outside, path.join(dir, "commands", "linked.md"));
+  await fs.symlink(outside, path.join(dir, rels[5]));
 
   assert.ok(parseEvolveArgs(["purge"]).verb === "purge" && !parseEvolveArgs(["purge"]).error, "'purge' needs no pick");
   assert.ok(parseEvolveArgs(["purge", "2"]).error, "purge takes no pick");
 
   const preview = await exec("evolve", "purge");
-  assert.ok(preview.includes("Run /evolve purge again to delete these 6 draft file(s)."), `the first purge only lists what it would delete: ${preview}`);
-  for (const rel of ["commands/a-generated-command.md", "skills/a-generated-skill/SKILL.md", "agents/a-generated-agent.md", "archive/old-draft.md", "legacy-0abc1234.md", "commands/linked.md"]) {
-    assert.ok(preview.includes(rel), `the preview names ${rel}`);
-  }
+  assert.ok(preview.includes("Run /evolve purge again within 2 minutes to move these 6 draft file(s) into"), `the first purge only lists what it would move: ${preview}`);
+  for (const rel of rels) assert.ok(preview.includes(rel), `the preview names ${rel}`);
   assert.ok(!preview.includes("cand-keep-proposed") && !preview.includes("cand-keep-archived"), "candidate files are never listed for purge");
-  await fs.access(path.join(dir, "commands", "a-generated-command.md"));
+  await fs.access(path.join(dir, rels[0]));
+
+  // A file rewritten at the same path after the preview (a new size) is a
+  // different listing: shown again, nothing moved.
+  await write(rels[3], "# Candidate skill: old, rewritten after the preview with more text\n");
+  const rewritten = await exec("evolve", "purge");
+  assert.ok(rewritten.includes("Run /evolve purge again within 2 minutes to move these 6 draft file(s)"), `a file changed at the same path since the preview is shown again: ${rewritten}`);
+  assert.equal(await fs.readFile(path.join(dir, rels[3]), "utf8"), "# Candidate skill: old, rewritten after the preview with more text\n", "and nothing was moved");
+  assert.deepEqual(await purgedDirs(), [], "no purge folder exists before a confirmed purge");
 
   const done = await exec("evolve", "purge");
-  assert.ok(done.includes("Deleted 6 draft file(s)"), `the second, identical purge deletes: ${done}`);
+  assert.ok(done.includes("Moved 6 draft file(s) into") && !done.includes("failed"), `the second, identical purge moves them: ${done}`);
+  const [purged, ...extra] = await purgedDirs();
+  assert.ok(purged && extra.length === 0, "exactly one .purged-<time> folder");
   for (const rel of ["commands", "skills", "agents", "archive", "legacy-0abc1234.md"]) {
-    await assert.rejects(fs.lstat(path.join(dir, rel)), `${rel} is gone, emptied directories included`);
+    await assert.rejects(fs.lstat(path.join(dir, rel)), `${rel} is gone from evolved/, emptied folders included`);
   }
-  assert.equal(await fs.readFile(outside, "utf8"), "not a draft\n", "a symlinked draft is removed as a link; its target is never touched");
+  assert.equal(await fs.readFile(path.join(dir, purged, rels[0]), "utf8"), "---\ndescription: x\n---\n# a-generated-command\n", "a moved draft keeps its path and content under the purge folder");
+  assert.ok((await fs.lstat(path.join(dir, purged, rels[5]))).isSymbolicLink(), "a symlinked draft is moved as a link");
+  assert.equal(await fs.readFile(outside, "utf8"), "not a draft\n", "and its target is never touched");
   assert.equal((await findCandidateById(dir, "cand-keep-proposed")).fields.status, "proposed", "a proposed candidate survives purge");
   assert.equal((await findCandidateById(dir, "cand-keep-archived")).fields.status, "archived", "an archived tombstone survives purge");
-  assert.ok((await exec("evolve", "purge")).includes("No drafts to purge"), "a purge with nothing left says so");
+  assert.ok((await exec("evolve", "purge")).includes("No drafts to purge"), "the purge folder itself is never listed again");
 
-  // A listing that changed between the preview and the second call is
-  // shown again instead of deleted.
+  // A listing that grew between the preview and the second call is shown
+  // again instead of moved.
   await write("commands/first.md", "x\n");
   await exec("evolve", "purge");
   await write("commands/second.md", "y\n");
   const changed = await exec("evolve", "purge");
-  assert.ok(changed.includes("Run /evolve purge again to delete these 2 draft file(s)."), `a listing that changed since the preview is shown again, not deleted: ${changed}`);
+  assert.ok(changed.includes("move these 2 draft file(s)"), `a listing that changed since the preview is shown again, not moved: ${changed}`);
   await fs.access(path.join(dir, "commands", "first.md"));
+
+  // A file that cannot move is reported with the rest moved, never thrown.
+  await write("commands/locked/stuck.md", "z\n");
+  const lockedDir = path.join(dir, "commands", "locked");
+  await fs.chmod(lockedDir, 0o555);
+  let writable = true;
+  try {
+    await fs.access(lockedDir, fsSync.constants.W_OK);
+  } catch {
+    writable = false;
+  }
+  assert.ok(!writable, "precondition: the locked folder refuses writes (the suite must not run as root)");
+  await exec("evolve", "purge");
+  const partial = await exec("evolve", "purge");
+  await fs.chmod(lockedDir, 0o755);
+  assert.ok(/Moved 2 draft file\(s\) into .*; failed 1: commands\/locked\/stuck\.md \(E[A-Z]+\)/.test(partial), `a partial failure reports the moved count and each failed file: ${partial}`);
+  await fs.access(path.join(lockedDir, "stuck.md"));
+  await assert.rejects(fs.access(path.join(dir, "commands", "first.md")), "the files that could move did");
+
+  // A maintenance log that cannot be written after the move is reported,
+  // and the move still counts.
+  const logPath = path.join(project.project_dir, "maintenance.log");
+  await fs.rm(logPath, { force: true });
+  await fs.mkdir(logPath);
+  await exec("evolve", "purge");
+  const unlogged = await exec("evolve", "purge");
+  await fs.rmdir(logPath);
+  assert.ok(unlogged.includes("Moved 1 draft file(s) into") && unlogged.includes("the maintenance log could not be written"), `a log failure after the move is reported, not thrown: ${unlogged}`);
+
+  // The confirmation expires: past PURGE_CONFIRM_TTL_MS the same listing
+  // is shown again and nothing moves.
+  let clock = 1_000_000;
+  const state = createEvolveState({ now: () => clock });
+  await write("commands/late.md", "late\n");
+  const first = await runEvolve(harness.ctx, options, "purge", state);
+  assert.ok(first.includes("move these 1 draft file(s)"), first);
+  clock += PURGE_CONFIRM_TTL_MS + 1000;
+  const expired = await runEvolve(harness.ctx, options, "purge", state);
+  assert.ok(expired.includes("Run /evolve purge again within 2 minutes"), `an expired confirmation shows the listing again: ${expired}`);
+  await fs.access(path.join(dir, "commands", "late.md"));
+  const confirmed = await runEvolve(harness.ctx, options, "purge", state);
+  assert.ok(confirmed.includes("Moved 1 draft file(s) into"), `a fresh confirmation within the window moves it: ${confirmed}`);
 }
