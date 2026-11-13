@@ -22,7 +22,7 @@ export async function run({ assert }) {
     if (seen.has(file)) continue;
     seen.add(file);
     const text = fs.readFileSync(new URL(file, root), "utf8");
-    for (const [, spec] of text.matchAll(/(?:from\s+|import\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g)) {
+    for (const [, spec] of text.matchAll(/(?:from\s+|import\s*\(\s*|import\s+)["'](\.{1,2}\/[^"']+)["']/g)) {
       const rel = path.posix.normalize(path.posix.join(path.posix.dirname(file), spec));
       assert.ok(covered(rel), `${file} imports ${spec} (${rel}), which package.json's files list must cover`);
       if (/\.m?js$/.test(rel) && fs.existsSync(new URL(rel, root))) queue.push(rel);
