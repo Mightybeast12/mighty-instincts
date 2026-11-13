@@ -23,7 +23,7 @@ The legend row at the bottom of an expanded panel (`lib/board-text.js` `LEGEND`)
 Fully expanded, the panel reads like this (`lib/board.js` builds the facts, `lib/board-text.js` builds the rows, `sidebar.js` lays them out as boxes):
 
 ```
-▾ Mighty Instincts v0.11.1
+▾ Mighty Instincts v0.11.2
   ▾ Learned habits               ● 16
       habits in prompts               6
       used today / this week      2 / 9
