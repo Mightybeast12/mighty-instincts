@@ -2,6 +2,10 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
+## Unreleased
+
+- Check in the smoke test that every local module a published file imports is published, bare side-effect imports included.
+
 ## v0.11.1 (2026-11-10)
 
 - Name the running version on the first line of the instincts tool's status (`plugin: mighty-instincts@<version>`, the spec form `opencode.json` pins).
