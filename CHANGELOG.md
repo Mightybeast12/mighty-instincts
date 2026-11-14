@@ -2,6 +2,10 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
+## Unreleased
+
+- Skill review: a subagent the review session runs in the background (OpenCode 2.3) and that has not reported keeps the review open; an idle before the session answered the last report is not its end; the watchdog interrupts the session, then the subagents still out.
+
 ## v0.12.0 (2026-11-14)
 
 - Remove the plugin's own temporary files a crashed write left, older than an hour, in maintenance (`cleanTmp`; logged, counted apart from `cleaned`).
