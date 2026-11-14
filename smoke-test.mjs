@@ -46,6 +46,7 @@ import {
   buildReviewPermissions,
   buildReviewPrompt,
   createReviewController,
+  pendingBackgroundSubagents,
   readReviewGate,
 } from "./lib/review.js";
 
@@ -4329,6 +4330,17 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   controller.stop();
 }
 
+// 23b2. A report's state is read past a ">" in a model-written description,
+//       and a report without a readable state is no report (the sibling
+//       critic's round 2, P3).
+{
+  const launch = { type: "assistant", content: [{ type: "tool", name: "subagent", state: { metadata: { sessionID: "ses_c1" }, content: [{ type: "text", text: "The subagent is working in the background (sessionID: ses_c1)." }] } }] };
+  const angled = (state) => ({ type: "synthetic", text: `<subagent sessionID="ses_c1" description="slice > 2" state="${state}">\nx\n</subagent>` });
+  assert.deepEqual(pendingBackgroundSubagents([launch, angled("running")]), ["ses_c1"], "an interim report with a > in its description is still interim");
+  assert.deepEqual(pendingBackgroundSubagents([launch, angled("completed")]), [], "and the final one is read");
+  assert.deepEqual(pendingBackgroundSubagents([launch, { type: "synthetic", text: '<subagent sessionID="ses_c1">\nx\n</subagent>' }]), ["ses_c1"], "a report without a readable state is no report");
+}
+
 // 23c. A background subagent that never reports holds the review only
 //      until the watchdog (review.timeoutMinutes): the run ends "timed
 //      out", the session is interrupted and the lock released.
@@ -4362,7 +4374,9 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   const runsLogPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-runs.log");
   const timedOut = await waitFor(async () => (await fs.readFile(runsLogPath, "utf8")).includes("finished session ses_review_wd: timed out"), { timeoutMs: 3000 });
   assert.ok(timedOut, "the watchdog ends a run still waiting on a subagent");
-  assert.deepEqual(interrupted, ["ses_review_wd"], "and interrupts the session");
+  // The sibling critic's round 2 (P3): the session first, then the
+  // subagents still out, so none of their cancelled reports resumes it.
+  assert.deepEqual(interrupted, ["ses_review_wd", "ses_child9"], "and interrupts the session, then the subagent still out");
   controller.stop();
 }
 
