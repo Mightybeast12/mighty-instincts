@@ -4305,7 +4305,16 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await fs.access(lockPath);
   assert.equal(afterRunCalls, 0, "a subagent's interim report (state running) is not its result");
 
-  transcript = [...transcript, { type: "synthetic", text: '<subagent sessionID="ses_child1" state="completed" description="slice">\ndone\n</subagent>' }];
+  // The sibling critic's round on mighty-reviewer 0218a3d..5605339: the
+  // last report lands just after the idle of the previous turn, before the
+  // session answers it (attributes in another order, too).
+  transcript = [...transcript, { type: "synthetic", text: '<subagent description="slice" state="completed" sessionID="ses_child1">\ndone\n</subagent>' }];
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await fs.access(lockPath);
+  assert.equal(afterRunCalls, 0, "an idle before the session has answered the last report is the previous turn's");
+
+  transcript = [...transcript, { type: "assistant", content: [{ type: "text", text: "Review written." }] }];
   eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
   const lockRemoved = await waitFor(async () => {
     try {
@@ -4317,6 +4326,43 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   });
   assert.ok(lockRemoved, "the idle after the last subagent's report finishes the review");
   assert.equal(afterRunCalls, 1, "and afterRun runs once");
+  controller.stop();
+}
+
+// 23c. A background subagent that never reports holds the review only
+//      until the watchdog (review.timeoutMinutes): the run ends "timed
+//      out", the session is interrupted and the lock released.
+{
+  const reviewRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-background-watchdog-"));
+  await fs.mkdir(path.join(reviewRoot, "skill-observations", "observation-log"), { recursive: true });
+  await fs.writeFile(path.join(reviewRoot, "skill-observations", "observation-log", "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+  const eventBus = createFakeEventBus();
+  const interrupted = [];
+  const fakeCtx = {
+    event: { subscribe: () => eventBus.subscribe() },
+    session: {
+      create: async () => ({ id: "ses_review_wd" }),
+      prompt: async () => ({}),
+      synthetic: async () => ({}),
+      context: async () => [
+        { type: "assistant", content: [{ type: "tool", name: "subagent", state: { metadata: { sessionID: "ses_child9" }, content: [{ type: "text", text: "The subagent is working in the background (sessionID: ses_child9)." }] } }] },
+      ],
+      get: async () => {
+        throw new Error("session.get should not be polled while the event bridge is available");
+      },
+      interrupt: async ({ sessionID }) => {
+        interrupted.push(sessionID);
+        return {};
+      },
+    },
+  };
+  const controller = createReviewController(fakeCtx, { board: { observationsRoot: reviewRoot }, review: { ...REVIEW_DEFAULTS, enabled: false, timeoutMinutes: 0.005 } });
+  assert.equal((await controller.run({ force: true })).spawned, true);
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_wd" } });
+  const runsLogPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-runs.log");
+  const timedOut = await waitFor(async () => (await fs.readFile(runsLogPath, "utf8")).includes("finished session ses_review_wd: timed out"), { timeoutMs: 3000 });
+  assert.ok(timedOut, "the watchdog ends a run still waiting on a subagent");
+  assert.deepEqual(interrupted, ["ses_review_wd"], "and interrupts the session");
   controller.stop();
 }
 
