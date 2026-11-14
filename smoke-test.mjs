@@ -4243,6 +4243,84 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
 }
 
 // ---------------------------------------------------------------------------
+// 23b. The review session's idle while a subagent it launched in the
+//      background has not reported is not its end (OpenCode 2.3 runs every
+//      subagent in the background and resumes the parent with each result;
+//      the sibling mighty-reviewer recorded four early verdicts that way on
+//      2026-11-14). The lock stays and nothing is logged until the last
+//      subagent has reported and the session idles again.
+// ---------------------------------------------------------------------------
+{
+  const reviewRoot = fsSync.mkdtempSync(path.join(TEMP_ROOT, "review-background-"));
+  await fs.mkdir(path.join(reviewRoot, "skill-observations", "observation-log"), { recursive: true });
+  await fs.writeFile(path.join(reviewRoot, "skill-observations", "observation-log", "0001-open.md"), "---\nstatus: open\n---\nbody\n", "utf8");
+  const eventBus = createFakeEventBus();
+  const launch = {
+    type: "assistant",
+    content: [
+      {
+        type: "tool",
+        name: "subagent",
+        state: {
+          status: "completed",
+          metadata: { sessionID: "ses_child1", status: "running" },
+          content: [{ type: "text", text: "The subagent is working in the background (sessionID: ses_child1). You will receive a <subagent> message when it goes idle." }],
+        },
+      },
+    ],
+  };
+  let transcript = [{ type: "user", text: "review" }, launch];
+  let afterRunCalls = 0;
+  const fakeCtx = {
+    event: { subscribe: () => eventBus.subscribe() },
+    session: {
+      create: async () => ({ id: "ses_review_bg" }),
+      prompt: async () => ({}),
+      synthetic: async () => ({}),
+      context: async () => transcript,
+      get: async () => {
+        throw new Error("session.get should not be polled while the event bridge is available");
+      },
+      interrupt: async () => ({}),
+    },
+  };
+  const controller = createReviewController(fakeCtx, { board: { observationsRoot: reviewRoot }, review: { ...REVIEW_DEFAULTS, enabled: false } }, {
+    afterRun: async () => {
+      afterRunCalls += 1;
+    },
+  });
+  assert.equal((await controller.run({ force: true })).spawned, true);
+  const lockPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-lock.json");
+  const runsLogPath = path.join(reviewRoot, "skill-observations", ".mighty-instincts", "review-runs.log");
+
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await fs.access(lockPath);
+  assert.ok(!(await fs.readFile(runsLogPath, "utf8")).includes("finished session ses_review_bg"), "an idle with a background subagent still out does not finish the review");
+  assert.equal(afterRunCalls, 0, "and afterRun waits");
+
+  transcript = [...transcript, { type: "synthetic", text: '<subagent sessionID="ses_child1" state="running" description="slice">\nhalf way\n</subagent>' }];
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await fs.access(lockPath);
+  assert.equal(afterRunCalls, 0, "a subagent's interim report (state running) is not its result");
+
+  transcript = [...transcript, { type: "synthetic", text: '<subagent sessionID="ses_child1" state="completed" description="slice">\ndone\n</subagent>' }];
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
+  const lockRemoved = await waitFor(async () => {
+    try {
+      await fs.access(lockPath);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  assert.ok(lockRemoved, "the idle after the last subagent's report finishes the review");
+  assert.equal(afterRunCalls, 1, "and afterRun runs once");
+  controller.stop();
+}
+
+// ---------------------------------------------------------------------------
 // 24. Plugin-level wiring (lib/plugin.js): /skill-review registers
 //     regardless of review.enabled, a disabled (default) review never
 //     calls ctx.session.create on its own, and turning review.enabled on
