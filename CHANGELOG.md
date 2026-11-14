@@ -4,7 +4,7 @@ One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bull
 
 ## Unreleased
 
-- Remove the plugin's own temporary files a crashed write left, older than an hour, in maintenance (`cleanTmp`, counted as cleaned).
+- Remove the plugin's own temporary files a crashed write left, older than an hour, in maintenance (`cleanTmp`; logged, counted apart from `cleaned`).
 
 ## v0.11.2 (2026-11-13)
 

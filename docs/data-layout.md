@@ -57,7 +57,7 @@ When project resolution fails (python not found on `PATH`, or any other `detect_
 | `instincts/archive/<id>.md` | `lib/maintain.js` `decayStep`, `lib/commands-instinct.js` `verbWrong` | Never deleted. |
 | `board-pointer-<hash>.json` | `lib/board.js`, `lib/board-pointer.js` | Lets the TUI half find `board-state.json` without running python. |
 | `archive/projects/<id>/` | `lib/maintain.js` `cleanupProjectsStep` | Never deleted outright. |
-| `<name>.tmp-<pid>-<ms>-<n>`, `.<name>.tmp-<pid>-<ms>-<n>` | every atomic writer (`lib/store.js` `uniqueSuffix`), renamed over its target | A write that died before its rename leaves one; `lib/maintain.js` `cleanStaleTmpStep` removes those older than an hour here, in `evolved/` and at the homunculus root (counted in the run line's `cleaned`). |
+| `<name>.tmp-<pid>-<ms>-<n>`, `.<name>.tmp-<pid>-<ms>-<n>` | every atomic writer (`lib/store.js` `uniqueSuffix`), renamed over its target | A write that died before its rename leaves one; `lib/maintain.js` `cleanStaleTmpStep` removes those older than an hour here, in `evolved/`, in the instinct folders and at the homunculus root (logged, never counted in the run line's `cleaned`). |
 
 ## Shared global bucket and registry
 

@@ -25,7 +25,7 @@ Run order follows `runMaintenance` (`lib/maintain.js`): repair, cleanTmp, prune,
 
 ### cleanTmp (`lib/maintain.js` `cleanStaleTmpStep`)
 
-Every atomic writer names its temporary file `<name>.tmp-<pid>-<ms>-<n>` and renames it over its target, so a write that dies in between leaves one behind. This step removes those older than an hour (a write in flight lives seconds) from the homunculus root, the project's folder and its `evolved/` folder: regular files of exactly that shape only, never a folder or a symlink. Each removal is a log line; the count goes into the run line's `cleaned`.
+Every atomic writer names its temporary file `<name>.tmp-<pid>-<ms>-<n>` and renames it over its target, so a write that dies in between leaves one behind. This step removes those older than an hour (a write in flight lives seconds) from the homunculus root, the project's folder, its `evolved/` folder and its instinct folders (`instincts/personal`, `inherited`, `pending`, `archive`): regular files of exactly that shape only (a pid, a 13-digit millisecond clock, a counter; a name like `report.tmp-2026-11-14` never matches), never a folder or a symlink. Each removal is a log line, and the count is kept apart from the run line's `cleaned`, which counts stale projects only.
 
 ### promote (`lib/maintain.js` `promoteStep`)
 
