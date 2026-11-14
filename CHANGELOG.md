@@ -2,6 +2,10 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
+## Unreleased
+
+- Remove the plugin's own temporary files a crashed write left, older than an hour, in maintenance (`cleanTmp`, counted as cleaned).
+
 ## v0.11.2 (2026-11-13)
 
 - Check in the smoke test that every local module a published file imports is published, bare side-effect imports included.

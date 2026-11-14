@@ -7,7 +7,7 @@ ECC's `continuous-learning-v2` skill is built for Claude Code: a bash hook (`obs
 OpenCode has no hook-daemon model and `ctx.generate.text` has no tools, so this plugin:
 
 - Observes through OpenCode's own `tool.hook`/`session.hook("prompt")` instead of a shell script (`lib/observe.js`).
-- Injects through `session.hook("context")` instead of editing prompt text, and runs its own maintenance sweep (promote/prune/decay/dedupe/evolve/repair/cleanupProjects) in-process on a timer, instead of relying on someone to run the CLI's equivalent commands by hand (`lib/inject.js`, `lib/maintain.js`).
+- Injects through `session.hook("context")` instead of editing prompt text, and runs its own maintenance sweep (promote/prune/decay/dedupe/evolve/repair/cleanupProjects/cleanTmp) in-process on a timer, instead of relying on someone to run the CLI's equivalent commands by hand (`lib/inject.js`, `lib/maintain.js`).
 - Runs the observer in-process, as a single `generate.text` call triggered from inside the plugin (no daemon, no separate process to start or supervise). Since the model has no tools, the plugin itself parses the model's markdown output and writes the instinct files (`lib/observer.js`).
 - Installs nothing beyond the plugin itself: no hooks are added to any Claude Code `settings.json`, no scripts are copied anywhere.
 

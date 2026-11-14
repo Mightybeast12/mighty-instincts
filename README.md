@@ -46,7 +46,7 @@ All options are optional; this is `mergeOptions({})` from `lib/plugin.js`, the r
   "observer": { "enabled": false, "runIntervalMinutes": 15, "minObservations": 40, "maxAnalysisLines": 300, "maxAnalysisBytes": 32768, "notify": true },
   "inject": { "enabled": true, "max": 5, "minConfidence": 0.8, "exclude": [] },
   "board": { "enabled": true, "sections": { "instincts": true, "observations": true, "evals": true }, "refreshSeconds": 30, "observationsRoot": null, "evalRoots": null, "compact": false },
-  "maintenance": { "intervalHours": 24, "dryRun": false, "promote": true, "prune": true, "decay": true, "dedupe": true, "evolve": true, "repair": true, "cleanupProjects": true },
+  "maintenance": { "intervalHours": 24, "dryRun": false, "promote": true, "prune": true, "decay": true, "dedupe": true, "evolve": true, "repair": true, "cleanupProjects": true, "cleanTmp": true },
   "review": { "enabled": false, "cadenceDays": 7, "sliceSize": 10, "cooldownHours": 24, "timeoutMinutes": 90, "startupDelaySeconds": 120, "pollMinutes": 15, "model": null, "agent": null, "externalDirectories": [] },
   "evolve": { "targets": { "skill": null, "command": null, "agent": null, "rule": null } },
   "prune": { "unusedDays": 30, "auto": false }

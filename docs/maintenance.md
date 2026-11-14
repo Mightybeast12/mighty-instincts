@@ -14,13 +14,18 @@ A background sweep keeps the instinct stores tidy without anyone ever running a 
   "dedupe": true,
   "evolve": true,
   "repair": true,
-  "cleanupProjects": true
+  "cleanupProjects": true,
+  "cleanTmp": true
 }
 ```
 
 ## Steps, in run order
 
-Run order follows `runMaintenance` (`lib/maintain.js`): repair, prune, decay, promote, graduate-pending, then evolve and cleanupProjects (both gated on their own cadence).
+Run order follows `runMaintenance` (`lib/maintain.js`): repair, cleanTmp, prune, decay, promote, graduate-pending, then evolve and cleanupProjects (both gated on their own cadence).
+
+### cleanTmp (`lib/maintain.js` `cleanStaleTmpStep`)
+
+Every atomic writer names its temporary file `<name>.tmp-<pid>-<ms>-<n>` and renames it over its target, so a write that dies in between leaves one behind. This step removes those older than an hour (a write in flight lives seconds) from the homunculus root, the project's folder and its `evolved/` folder: regular files of exactly that shape only, never a folder or a symlink. Each removal is a log line; the count goes into the run line's `cleaned`.
 
 ### promote (`lib/maintain.js` `promoteStep`)
 
