@@ -4315,6 +4315,16 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   await fs.access(lockPath);
   assert.equal(afterRunCalls, 0, "an idle before the session has answered the last report is the previous turn's");
 
+  // The sibling critic's round on B29 (P3 4): the session sends the
+  // subagent back to work in its own session after its report; the idle
+  // that follows waits for its next report.
+  transcript = [...transcript, launch, { type: "assistant", content: [{ type: "text", text: "Sent it back for the second slice." }] }];
+  eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await fs.access(lockPath);
+  assert.equal(afterRunCalls, 0, "an idle while a relaunched subagent is out does not finish the review");
+  transcript = [...transcript, { type: "synthetic", text: '<subagent sessionID="ses_child1" state="completed" description="slice 2">\ndone again\n</subagent>' }];
+
   transcript = [...transcript, { type: "assistant", content: [{ type: "text", text: "Review written." }] }];
   eventBus.push({ type: "session.idle", properties: { sessionID: "ses_review_bg" } });
   const lockRemoved = await waitFor(async () => {
