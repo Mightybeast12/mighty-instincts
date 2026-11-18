@@ -4339,6 +4339,13 @@ function contextEvent({ sessionID = "ctx-s1", userText = "", system = [], extraM
   assert.deepEqual(pendingBackgroundSubagents([launch, angled("running")]), ["ses_c1"], "an interim report with a > in its description is still interim");
   assert.deepEqual(pendingBackgroundSubagents([launch, angled("completed")]), [], "and the final one is read");
   assert.deepEqual(pendingBackgroundSubagents([launch, { type: "synthetic", text: '<subagent sessionID="ses_c1">\nx\n</subagent>' }]), ["ses_c1"], "a report without a readable state is no report");
+  // A subagent sent back to work in its own session after it reported is
+  // out again until its next report (the sibling's lane C405 review,
+  // 2026-11-17: four relaunched critics still running at its verdict).
+  assert.deepEqual(pendingBackgroundSubagents([launch, angled("completed"), launch]), ["ses_c1"], "a subagent relaunched after its report is pending again");
+  assert.deepEqual(pendingBackgroundSubagents([launch, angled("completed"), launch, angled("completed")]), [], "until it reports again");
+  const both = { type: "assistant", content: [{ type: "tool", name: "subagent", state: { metadata: { sessionID: "ses_c2" }, content: [{ type: "text", text: 'The subagent is working in the background (sessionID: ses_c2).\n<subagent sessionID="ses_c2" state="completed">\ndone\n</subagent>' }] } }] };
+  assert.deepEqual(pendingBackgroundSubagents([both]), [], "a launch output that carries the final report is not pending");
 }
 
 // 23c. A background subagent that never reports holds the review only
