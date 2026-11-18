@@ -2,7 +2,7 @@
 
 One entry per release tag (`git tag --sort=-v:refname`), newest first. Each bullet is one of `git log <previous-tag>..<tag> --format=%s`; the bare "Release X" version-bump commit is omitted wherever a tag also has a substantive commit, and the Unreleased bullets below are condensed summaries, not verbatim commit subjects.
 
-## Unreleased
+## v0.12.2 (2026-11-18)
 
 - Skill review: a subagent sent back to work in its own session after it reported is out again until its next report (the sibling's lane C405 review recorded its verdict with four relaunched critics still running).
 
